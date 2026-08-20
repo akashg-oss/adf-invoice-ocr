@@ -14,25 +14,27 @@ def parse_and_match_invoices(pdf_file, df_master):
     reader = pypdf.PdfReader(pdf_file)
     full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
 
-    # 1. Extract Header Details (Invoice Number, PO Number, Destination)
-    inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", full_text)
+    # 1. Extract Invoice Number
+    inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", full_text, re.IGNORECASE)
     inv_num = inv_match.group(0) if inv_match else "UNKNOWN"
 
+    # 2. Extract PO Number (Case-insensitive multi-line extraction)
     po_match = re.search(
-        r"Buyer(?:'|’)?s\s*Order\s*No\.?\s*\n?\s*([A-Z0-9/-]+)",
+        r"Buyer(?:'|’|s|\s)*Order\s*No\.?\s*\n?\s*([A-Z0-9/-]+)",
         full_text,
         re.IGNORECASE,
     )
     po_number = po_match.group(1).strip() if po_match else "UNKNOWN"
 
+    # 3. Extract Destination (Handles ALL CAPS, Title Case, spaces, and punctuation)
     dest_match = re.search(
-        r"Destination\s*\n?\s*([A-Za-z\s]+?)(?=\n|Motor|Terms|\Z)",
+        r"Destination\s*\n?\s*([A-Za-z0-9\s.\-]+?)(?=\n[A-Z][a-z]|\n\n|\nMotor|\nTerms|\Z)",
         full_text,
         re.IGNORECASE,
     )
     destination = dest_match.group(1).strip() if dest_match else "UNKNOWN"
 
-    # Helper Functions
+    # SKU Matching Helpers
     def clean_tokens(text):
         s = re.sub(r"[^A-Z0-9]", " ", str(text).upper())
         stop_words = {
@@ -114,7 +116,7 @@ def parse_and_match_invoices(pdf_file, df_master):
             )
         return "", "", raw_item_desc, 0.0
 
-    # 2. Extract Line Items
+    # Line Item Parser
     items = []
     p1_lines = reader.pages[0].extract_text().split("\n")
 
