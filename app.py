@@ -14,10 +14,25 @@ def parse_and_match_invoices(pdf_file, df_master):
     reader = pypdf.PdfReader(pdf_file)
     full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
 
-    # 1. Extract Invoice Number
+    # 1. Extract Header Details (Invoice Number, PO Number, Destination)
     inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", full_text)
     inv_num = inv_match.group(0) if inv_match else "UNKNOWN"
 
+    po_match = re.search(
+        r"Buyer(?:'|’)?s\s*Order\s*No\.?\s*\n?\s*([A-Z0-9/-]+)",
+        full_text,
+        re.IGNORECASE,
+    )
+    po_number = po_match.group(1).strip() if po_match else "UNKNOWN"
+
+    dest_match = re.search(
+        r"Destination\s*\n?\s*([A-Za-z\s]+?)(?=\n|Motor|Terms|\Z)",
+        full_text,
+        re.IGNORECASE,
+    )
+    destination = dest_match.group(1).strip() if dest_match else "UNKNOWN"
+
+    # Helper Functions
     def clean_tokens(text):
         s = re.sub(r"[^A-Z0-9]", " ", str(text).upper())
         stop_words = {
@@ -112,7 +127,6 @@ def parse_and_match_invoices(pdf_file, df_master):
             desc_parts = [sl_match.group(2)]
 
             i += 1
-            # Gather wrapped description lines until hitting the value line with 'PCS'
             while i < len(p1_lines) and "PCS" not in p1_lines[i]:
                 if p1_lines[i].strip():
                     desc_parts.append(p1_lines[i].strip())
@@ -125,12 +139,10 @@ def parse_and_match_invoices(pdf_file, df_master):
 
             num_line = p1_lines[i] if i < len(p1_lines) else ""
 
-            # Extract numeric values reliably using string splitting
             try:
                 parts = num_line.split("PCS")
                 amount = float(parts[0].replace(",", "").strip())
 
-                # Extract rate and quantity from middle chunk (e.g. "65.593,888.0000")
                 m_rate_qty = re.match(
                     r"^([\d,]+\.\d{2})([\d,]+(?:\.\d+)?)", parts[1].strip()
                 )
@@ -151,6 +163,8 @@ def parse_and_match_invoices(pdf_file, df_master):
                 "Name of FG": sku_name,
                 "Invoice Raw Desc": clean_desc,
                 "Invoice Number": inv_num,
+                "PO Number": po_number,
+                "Destination": destination,
                 "Quantity Dispatched (PCS)": int(qty_pcs),
                 "Price of FG (₹/PCS)": rate,
                 "Amount (₹)": amount,
