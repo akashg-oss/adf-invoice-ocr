@@ -1,19 +1,25 @@
 import difflib
 import re
 import pandas as pd
-import pypdf
+import pdfplumber  # Replace pypdf import
 
 
 def parse_and_match_invoices(pdf_path, master_excel_path):
     df_master = pd.read_excel(master_excel_path)
-    reader = pypdf.PdfReader(pdf_path)
-    full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
 
-    # 1. Extract Invoice Number (Fixes 'e-Way' capture)
+    # Extract text using pdfplumber
+    full_text = ""
+    pages_text = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            pages_text.append(t)
+            full_text += t + "\n"
+
+    # 1. Extract Invoice Number
     inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", full_text)
     inv_num = inv_match.group(0) if inv_match else "UNKNOWN"
 
-    # Helper: Clean tokens for matching
     def clean_tokens(text):
         s = re.sub(r"[^A-Z0-9]", " ", str(text).upper())
         stop_words = {
@@ -37,12 +43,10 @@ def parse_and_match_invoices(pdf_path, master_excel_path):
         }
         return [t for t in s.split() if t not in stop_words]
 
-    # Helper: Extract volume size
     def extract_size(text):
         m = re.search(r"(\d+\s*ML)", str(text), re.IGNORECASE)
         return m.group(1).upper().replace(" ", "") if m else ""
 
-    # Helper: Fuzzy match against Master Catalog
     def match_sku(raw_item_desc):
         vol = extract_size(raw_item_desc)
         subset = df_master.copy()
@@ -97,9 +101,9 @@ def parse_and_match_invoices(pdf_path, master_excel_path):
             )
         return "", "", raw_item_desc, 0.0
 
-    # 2. Extract Line Items with Multi-line Concatenation
+    # 2. Line Items Extraction
     items = []
-    p1_lines = reader.pages[0].extract_text().split("\n")
+    p1_lines = pages_text[0].split("\n")
 
     i = 0
     while i < len(p1_lines):
@@ -110,7 +114,6 @@ def parse_and_match_invoices(pdf_path, master_excel_path):
             desc_parts = [sl_match.group(2)]
 
             i += 1
-            # Multi-line wrap fix: Concatenate wrapped description lines until reaching the PCS/Rate line
             while i < len(p1_lines) and "PCS" not in p1_lines[i]:
                 if p1_lines[i].strip():
                     desc_parts.append(p1_lines[i].strip())
@@ -121,7 +124,6 @@ def parse_and_match_invoices(pdf_path, master_excel_path):
                 r"\s+X\s+\d+$", "", raw_desc, flags=re.IGNORECASE
             ).strip()
 
-            # Values extraction (Amount, Rate, Quantity)
             num_line = p1_lines[i] if i < len(p1_lines) else ""
             m_vals = re.search(
                 r"([\d,]+\.\d+)PCS(\d+\.\d{2})([\d,]+\.\d+)\s*PCS", num_line
@@ -151,14 +153,3 @@ def parse_and_match_invoices(pdf_path, master_excel_path):
         i += 1
 
     return pd.DataFrame(items)
-
-
-# Run extraction across both files
-pdf_files = [
-    "3147 - MANASH LIFESTYLE - SV.pdf",
-    "3148 - MANASH LIFESTYLE - SV.pdf",
-]
-dfs = [parse_and_match_invoices(f, "EAN_SKU.xlsx") for f in pdf_files]
-df_final = pd.concat(dfs, ignore_index=True)
-
-print(df_final.to_string())
