@@ -16,9 +16,24 @@ OUTPUT_COLUMNS = [
     "Price of FG (₹/PCS)"
 ]
 
+CITY_MAP = {
+    "GURGAON": "Gurgaon", "GURUGRAM": "Gurgaon", "HARYANA": "Gurgaon",
+    "BANGALORE": "Bangalore", "BANGLORE": "Bangalore", "BENGALURU": "Bangalore",
+    "KOLKATA": "Kolkata", "HOWRAH": "Howrah", "THANE": "Thane",
+    "MUMBAI": "Mumbai", "DELHI": "Delhi", "NEW DELHI": "Delhi",
+    "HYDERABAD": "Hyderabad", "CHENNAI": "Chennai", "PUNE": "Pune",
+    "AHMEDABAD": "Ahmedabad", "NOIDA": "Noida", "BHIWANDI": "Bhiwandi"
+}
+
 def norm(x):
     if pd.isna(x): return ""
     return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", str(x).upper())).strip()
+
+def clean_sku_str(s):
+    s = norm(s)
+    # Strip common invoice noise words to expose core product variant & volume
+    s = re.sub(r"\b(FG|PURPLLE|PER|STAY|33030050|PCS|BOX|X)\b", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 def load_master(f):
     df = pd.read_excel(f, dtype=str)
@@ -64,43 +79,45 @@ def extract_text(data):
             pass
     return text
 
-def first(patterns, text):
-    for p in patterns:
-        m = re.search(p, text, re.I)
-        if m: return m.group(1).strip()
-    return ""
-
 def parse(text):
-    # 1. Invoice Number (exclusively matches invoice pattern, ignoring static headers like "TAX")
-    inv = first([
-        r"\b(ADF/\d{4}-\d{2}/\d+)\b",
-        r"Invoice\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_]{5,})"
-    ], text)
-    if inv.upper() in ["TAX", "INVOICE", "TAX INVOICE"]:
-        inv = ""
+    # 1. Invoice Number
+    inv = ""
+    m_inv = re.search(r"\b(ADF/\d{4}-\d{2}/\d+)\b", text, re.I)
+    if not m_inv:
+        m_inv = re.search(r"Invoice\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_]{5,})", text, re.I)
+    if m_inv and m_inv.group(1).upper() not in ["TAX", "INVOICE", "TAX INVOICE"]:
+        inv = m_inv.group(1).strip()
 
-    # 2. PO Number (extracts numeric/alphanumeric PO, ignoring labels like "Dated")
-    po = first([
-        r"Buyer[’']?s\s+Order\s+No\.?\s*[:\-]?\s*([0-9A-Z\/\-_]{5,})",
-        r"PO\s*(?:No|Number)?\.?\s*[:\-]?\s*([0-9A-Z\/\-_]{5,})"
-    ], text)
-    if po.upper() in ["DATED", "DATE"]:
-        po = ""
+    # 2. PO Number
+    po = ""
+    m_po = re.search(r"Buyer[’']?s\s+Order\s+No\.?\s*[:\-]?\s*([0-9A-Z\/\-_]{5,})", text, re.I)
+    if not m_po:
+        m_po = re.search(r"PO\s*(?:No|Number)?\.?\s*[:\-]?\s*([0-9A-Z\/\-_]{5,})", text, re.I)
+    if m_po and m_po.group(1).upper() not in ["DATED", "DATE"]:
+        po = m_po.group(1).strip()
 
-    # 3. City / Destination (ignores static label "(Ship to)")
-    dest = first([
-        r"Destination\s*[:\-]?\s*([A-Za-z\s]{3,})",
-        r"Ship\s*To\s*[:\-]?\s*([A-Za-z\s]{3,})"
-    ], text)
-    if "(SHIP TO)" in dest.upper() or dest.upper() in ["SHIP TO", "(SHIP TO)", "DATED"]:
-        dest = ""
+    # 3. City / Destination Extraction
+    city = ""
+    m_dest = re.search(r"Destination\s*[:\-]?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
+    if not m_dest:
+        m_dest = re.search(r"Ship\s*To\s*[:\-]?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
+    if not m_dest:
+        m_dest = re.search(r"Consignee\s*\(Ship\s*to\)\s*[:\-]?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
 
-    d = norm(dest)
-    if any(k in d for k in ["GURGAON", "GURUGRAM", "HARYANA"]): dest = "Gurgaon"
-    elif any(k in d for k in ["BANGLORE", "BANGALORE"]): dest = "Bangalore"
-    elif d in ("KOLKATA", "HOWRAH", "THANE", "MUMBAI", "DELHI"): dest = d.title()
+    raw_dest = norm(m_dest.group(1)) if m_dest else norm(text)
+    
+    # Map raw destination string against known cities
+    for k, v in CITY_MAP.items():
+        if k in raw_dest:
+            city = v
+            break
+            
+    if not city and m_dest:
+        clean_d = re.sub(r"\(SHIP TO\)|DATED|INVOICE", "", raw_dest).strip()
+        if clean_d and len(clean_d) > 2:
+            city = clean_d.title()
 
-    # 4. Extract Line Items (Page 1 Only)
+    # 4. Line Items Extraction (Page 1 Only)
     items = []
     lines = text.split("\n")
     
@@ -109,13 +126,11 @@ def parse(text):
         if not line_clean:
             continue
 
-        # Skip summary BOX lines (e.g. "1 FG-PURPLLE-PER-20ML 33030050 88.00 BOX")
+        # Skip Box summary/total rows
         if re.search(r"\bBOX\b", line_clean, re.I) and not re.search(r"\bPCS\b", line_clean, re.I):
             continue
-        if re.match(r"^\d+\s+FG-", line_clean, re.I) and "BOX" in line_clean.upper():
-            continue
 
-        # Primary pattern: Captures detailed item rows containing PCS quantities
+        # Item pattern: captures product name, PCS quantity, and unit price
         m = re.search(
             r"(?:33030050\s+)?(FG-[A-Z0-9\s\-\/\.\&]+?)(?:\s+X|\s+33030050)?\s+.*?([\d,]+(?:\.\d+)?)\s*PCS\s+([\d,]+\.\d+)", 
             line_clean, 
@@ -123,8 +138,6 @@ def parse(text):
         )
         if m:
             fg_desc = m.group(1).strip()
-            
-            # Cleanup leading numbers, HSN codes, and trailing 'X'
             fg_desc = re.sub(r"\s+X$", "", fg_desc, flags=re.I).strip()
             fg_desc = re.sub(r"^\d+\s+", "", fg_desc).strip()
             fg_desc = re.sub(r"^33030050\s+", "", fg_desc).strip()
@@ -136,41 +149,30 @@ def parse(text):
             except ValueError:
                 continue
 
-    # Secondary pattern fallback if strict FG prefix is absent on page 1
-    if not items:
-        for line in lines:
-            line_clean = line.strip()
-            if not line_clean or ("BOX" in line_clean.upper() and "PCS" not in line_clean.upper()):
-                continue
-            m = re.search(
-                r"([A-Z0-9\s\-\/\.\&]{5,})\s+([\d,]+(?:\.\d+)?)\s*PCS\s+([\d,]+\.\d+)", 
-                line_clean, 
-                re.I
-            )
-            if m:
-                fg_desc = m.group(1).strip()
-                if any(h in fg_desc.upper() for h in ["DESCRIPTION", "TOTAL", "SUBTOTAL", "INVOICE", "TAXABLE", "AMOUNT"]):
-                    continue
-                try:
-                    qty = int(round(float(m.group(2).replace(",", ""))))
-                    rate = float(m.group(3).replace(",", ""))
-                    items.append((fg_desc, qty, rate))
-                except ValueError:
-                    continue
-
-    return inv, po, dest, items
+    return inv, po, city, items
 
 def match(s, master):
-    clean_s = norm(s)
-    norm_master_names = [norm(x) for x in master["SKU Name"]]
+    clean_s = clean_sku_str(s)
+    if not clean_s:
+        clean_s = norm(s)
+        
+    master_sku_names = master["SKU Name"].tolist()
+    master_clean = [clean_sku_str(x) for x in master_sku_names]
 
-    if clean_s in norm_master_names:
-        idx = norm_master_names.index(clean_s)
+    # 1. Direct exact clean match
+    if clean_s in master_clean:
+        idx = master_clean.index(clean_s)
         return master.iloc[idx], 100
 
-    res = process.extractOne(clean_s, norm_master_names, scorer=fuzz.token_set_ratio)
-    if res and res[1] >= 70:
+    # 2. High-precision fuzzy token match on cleaned names
+    res = process.extractOne(clean_s, master_clean, scorer=fuzz.token_set_ratio)
+    if res and res[1] >= 60:
         return master.iloc[res[2]], res[1]
+
+    # 3. Fallback fuzzy match on raw master names
+    res_raw = process.extractOne(norm(s), [norm(x) for x in master_sku_names], scorer=fuzz.token_set_ratio)
+    if res_raw and res_raw[1] >= 60:
+        return master.iloc[res_raw[2]], res_raw[1]
 
     return None, 0
 
@@ -191,7 +193,7 @@ def make_excel(df):
 # Streamlit UI
 st.set_page_config(page_title="ADF Invoice OCR → Standard Excel", layout="wide")
 st.title("ADF Invoice OCR → Standard Excel")
-st.caption("Upload your EAN / SKU master and ADF invoices. Reads line items strictly from Page 1.")
+st.caption("Upload EAN/SKU master and ADF invoices. Extracts line items, maps SKU/EAN, and detects destination city.")
 
 mf = st.file_uploader("1. Upload EAN ↔ SKU Master Excel", type=["xlsx", "xls"])
 pf = st.file_uploader("2. Upload ADF Invoice PDFs", type=["pdf"], accept_multiple_files=True)
@@ -218,12 +220,13 @@ if mf and pf and st.button("🚀 Process Invoices", type="primary"):
             m, score = match(s, master)
             if m is None:
                 issues.append([f.name, f"Product mapping not found: {s}"])
-                sku = ean = name = ""
+                sku = ean = ""
+                fg_name = s
             else:
-                sku, ean, name = m["SKU Code"], m["EAN"], m["SKU Name"]
-                if score < 90: 
-                    issues.append([f.name, f"Product match {score}%: {s} → {name}"])
-            rows.append([sku, ean, name or s, inv, city, po, q, r])
+                sku, ean, fg_name = m["SKU Code"], m["EAN"], m["SKU Name"]
+                if score < 85: 
+                    issues.append([f.name, f"Product match {score}%: {s} → {fg_name}"])
+            rows.append([sku, ean, fg_name, inv, city, po, q, r])
             
     result = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
     if result.empty: 
