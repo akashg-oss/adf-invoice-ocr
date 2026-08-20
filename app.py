@@ -17,8 +17,8 @@ OUTPUT_COLUMNS = [
 ]
 
 CITY_MAP = {
+    "BANGLORE": "Bangalore", "BANGALORE": "Bangalore", "BENGALURU": "Bangalore",
     "GURGAON": "Gurgaon", "GURUGRAM": "Gurgaon", "HARYANA": "Gurgaon",
-    "BANGALORE": "Bangalore", "BANGLORE": "Bangalore", "BENGALURU": "Bangalore",
     "KOLKATA": "Kolkata", "HOWRAH": "Howrah", "THANE": "Thane",
     "MUMBAI": "Mumbai", "DELHI": "Delhi", "NEW DELHI": "Delhi",
     "HYDERABAD": "Hyderabad", "CHENNAI": "Chennai", "PUNE": "Pune",
@@ -31,7 +31,7 @@ def norm(x):
 
 def clean_sku_str(s):
     s = norm(s)
-    # Strip common invoice noise words to expose core product variant & volume
+    # Strip invoice prefix/suffix noise words to expose core fragrance variant & volume
     s = re.sub(r"\b(FG|PURPLLE|PER|STAY|33030050|PCS|BOX|X)\b", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -60,7 +60,7 @@ def load_master(f):
     return out[(out.EAN != "") & (out["SKU Code"] != "") & (out["SKU Name"] != "")].drop_duplicates()
 
 def extract_text(data):
-    # Strictly extract text from Page 1 (index 0) only
+    # Extract text exclusively from Page 1
     with pdfplumber.open(io.BytesIO(data)) as pdf:
         if not pdf.pages:
             return ""
@@ -80,13 +80,15 @@ def extract_text(data):
     return text
 
 def parse(text):
-    # 1. Invoice Number
+    # 1. Invoice Number (Handles wrapping across newlines e.g. ADF/2026\n-27/3147)
     inv = ""
-    m_inv = re.search(r"\b(ADF/\d{4}-\d{2}/\d+)\b", text, re.I)
-    if not m_inv:
-        m_inv = re.search(r"Invoice\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_]{5,})", text, re.I)
-    if m_inv and m_inv.group(1).upper() not in ["TAX", "INVOICE", "TAX INVOICE"]:
-        inv = m_inv.group(1).strip()
+    m_inv = re.search(r"\b(ADF/\d{4}\s*-\s*\d{2}/\d+)\b", text, re.I)
+    if m_inv:
+        inv = re.sub(r"\s+", "", m_inv.group(1))
+    else:
+        m_inv = re.search(r"Invoice\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_\s]{5,20})", text, re.I)
+        if m_inv and m_inv.group(1).strip().upper() not in ["TAX", "INVOICE", "TAX INVOICE"]:
+            inv = re.sub(r"\s+", "", m_inv.group(1))
 
     # 2. PO Number
     po = ""
@@ -96,58 +98,38 @@ def parse(text):
     if m_po and m_po.group(1).upper() not in ["DATED", "DATE"]:
         po = m_po.group(1).strip()
 
-    # 3. City / Destination Extraction
+    # 3. City / Destination
     city = ""
-    m_dest = re.search(r"Destination\s*[:\-]?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
-    if not m_dest:
-        m_dest = re.search(r"Ship\s*To\s*[:\-]?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
-    if not m_dest:
-        m_dest = re.search(r"Consignee\s*\(Ship\s*to\)\s*[:\-]?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
-
+    m_dest = re.search(r"Destination\s*\n?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
     raw_dest = norm(m_dest.group(1)) if m_dest else norm(text)
     
-    # Map raw destination string against known cities
     for k, v in CITY_MAP.items():
         if k in raw_dest:
             city = v
             break
-            
-    if not city and m_dest:
-        clean_d = re.sub(r"\(SHIP TO\)|DATED|INVOICE", "", raw_dest).strip()
-        if clean_d and len(clean_d) > 2:
-            city = clean_d.title()
 
-    # 4. Line Items Extraction (Page 1 Only)
+    # 4. Multiline Item Parsing (Captures 4 SKUs even when names wrap across multiple lines)
     items = []
-    lines = text.split("\n")
     
-    for line in lines:
-        line_clean = line.strip()
-        if not line_clean:
+    # Matches: Item_Index + Multiline_FG_Name + HSN + Box_Qty + Dispatched_PCS_Qty + Unit_Price
+    pat = re.compile(
+        r"(?:(?<=\n)|\A)\s*\d+\s+(FG-[\s\S]+?)\s+(?:33030050|\d{8})\s+[\d,]+\.\d+\s*BOX\s+([\d,]+(?:\.\d+)?)\s*PCS\s+([\d,]+\.\d+)\s*PCS",
+        re.I
+    )
+    
+    for m in pat.finditer(text):
+        raw_desc = m.group(1)
+        # Collapse newlines inside description into a single space
+        clean_desc = re.sub(r"\s+", " ", raw_desc).strip()
+        # Remove box package multiplier (e.g., 'X 48')
+        clean_desc = re.sub(r"\s+X\s+\d+$", "", clean_desc, flags=re.I).strip()
+        
+        try:
+            qty = int(round(float(m.group(2).replace(",", ""))))
+            rate = float(m.group(3).replace(",", ""))
+            items.append((clean_desc, qty, rate))
+        except ValueError:
             continue
-
-        # Skip Box summary/total rows
-        if re.search(r"\bBOX\b", line_clean, re.I) and not re.search(r"\bPCS\b", line_clean, re.I):
-            continue
-
-        # Item pattern: captures product name, PCS quantity, and unit price
-        m = re.search(
-            r"(?:33030050\s+)?(FG-[A-Z0-9\s\-\/\.\&]+?)(?:\s+X|\s+33030050)?\s+.*?([\d,]+(?:\.\d+)?)\s*PCS\s+([\d,]+\.\d+)", 
-            line_clean, 
-            re.I
-        )
-        if m:
-            fg_desc = m.group(1).strip()
-            fg_desc = re.sub(r"\s+X$", "", fg_desc, flags=re.I).strip()
-            fg_desc = re.sub(r"^\d+\s+", "", fg_desc).strip()
-            fg_desc = re.sub(r"^33030050\s+", "", fg_desc).strip()
-            
-            try:
-                qty = int(round(float(m.group(2).replace(",", ""))))
-                rate = float(m.group(3).replace(",", ""))
-                items.append((fg_desc, qty, rate))
-            except ValueError:
-                continue
 
     return inv, po, city, items
 
@@ -159,17 +141,17 @@ def match(s, master):
     master_sku_names = master["SKU Name"].tolist()
     master_clean = [clean_sku_str(x) for x in master_sku_names]
 
-    # 1. Direct exact clean match
+    # 1. Direct clean string match
     if clean_s in master_clean:
         idx = master_clean.index(clean_s)
         return master.iloc[idx], 100
 
-    # 2. High-precision fuzzy token match on cleaned names
+    # 2. Token Set Ratio Fuzzy Search
     res = process.extractOne(clean_s, master_clean, scorer=fuzz.token_set_ratio)
     if res and res[1] >= 60:
         return master.iloc[res[2]], res[1]
 
-    # 3. Fallback fuzzy match on raw master names
+    # 3. Fallback search on raw master descriptions
     res_raw = process.extractOne(norm(s), [norm(x) for x in master_sku_names], scorer=fuzz.token_set_ratio)
     if res_raw and res_raw[1] >= 60:
         return master.iloc[res_raw[2]], res_raw[1]
@@ -193,7 +175,7 @@ def make_excel(df):
 # Streamlit UI
 st.set_page_config(page_title="ADF Invoice OCR → Standard Excel", layout="wide")
 st.title("ADF Invoice OCR → Standard Excel")
-st.caption("Upload EAN/SKU master and ADF invoices. Extracts line items, maps SKU/EAN, and detects destination city.")
+st.caption("Upload your EAN / SKU master and ADF invoices. Reads all line items from Page 1.")
 
 mf = st.file_uploader("1. Upload EAN ↔ SKU Master Excel", type=["xlsx", "xls"])
 pf = st.file_uploader("2. Upload ADF Invoice PDFs", type=["pdf"], accept_multiple_files=True)
