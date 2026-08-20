@@ -29,11 +29,11 @@ def norm(x):
     if pd.isna(x): return ""
     return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", str(x).upper())).strip()
 
-def clean_sku_str(s):
+def extract_variant_tokens(s):
+    # Extracts distinct variant words (e.g., OUD, AMBER, BLOOM, SUGAR)
     s = norm(s)
-    # Strip invoice prefix/suffix noise words to expose core fragrance variant & volume
-    s = re.sub(r"\b(FG|PURPLLE|PER|STAY|33030050|PCS|BOX|X)\b", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    ignore = {"FG", "PURPLLE", "PER", "20ML", "STAY", "33030050", "PCS", "BOX", "X", "48", "TILL", "AFTER", "UNTIL"}
+    return {w for w in s.split() if w not in ignore}
 
 def load_master(f):
     df = pd.read_excel(f, dtype=str)
@@ -57,13 +57,11 @@ def load_master(f):
     out.columns = ["EAN", "SKU Code", "SKU Name"]
     for c in out.columns: 
         out[c] = out[c].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    return out[(out.EAN != "") & (out["SKU Code"] != "") & (out["SKU Name"] != "")].drop_duplicates()
+    return out[(out.EAN != "") & (out["SKU Code"] != "") & (out["SKU Name"] != "")].drop_duplicates().reset_index(drop=True)
 
 def extract_text(data):
-    # Extract text exclusively from Page 1
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        if not pdf.pages:
-            return ""
+        if not pdf.pages: return ""
         text = pdf.pages[0].extract_text() or ""
         
     if len(re.sub(r"\s+", "", text)) < 100:
@@ -80,7 +78,6 @@ def extract_text(data):
     return text
 
 def parse(text):
-    # 1. Invoice Number (Handles wrapping across newlines e.g. ADF/2026\n-27/3147)
     inv = ""
     m_inv = re.search(r"\b(ADF/\d{4}\s*-\s*\d{2}/\d+)\b", text, re.I)
     if m_inv:
@@ -90,7 +87,6 @@ def parse(text):
         if m_inv and m_inv.group(1).strip().upper() not in ["TAX", "INVOICE", "TAX INVOICE"]:
             inv = re.sub(r"\s+", "", m_inv.group(1))
 
-    # 2. PO Number
     po = ""
     m_po = re.search(r"Buyer[’']?s\s+Order\s+No\.?\s*[:\-]?\s*([0-9A-Z\/\-_]{5,})", text, re.I)
     if not m_po:
@@ -98,20 +94,16 @@ def parse(text):
     if m_po and m_po.group(1).upper() not in ["DATED", "DATE"]:
         po = m_po.group(1).strip()
 
-    # 3. City / Destination
     city = ""
     m_dest = re.search(r"Destination\s*\n?\s*([A-Za-z0-9\s\,\-]+)", text, re.I)
     raw_dest = norm(m_dest.group(1)) if m_dest else norm(text)
-    
     for k, v in CITY_MAP.items():
         if k in raw_dest:
             city = v
             break
 
-    # 4. Multiline Item Parsing (Captures 4 SKUs even when names wrap across multiple lines)
     items = []
-    
-    # Matches: Item_Index + Multiline_FG_Name + HSN + Box_Qty + Dispatched_PCS_Qty + Unit_Price
+    # Extract line item block using Sl No anchors
     pat = re.compile(
         r"(?:(?<=\n)|\A)\s*\d+\s+(FG-[\s\S]+?)\s+(?:33030050|\d{8})\s+[\d,]+\.\d+\s*BOX\s+([\d,]+(?:\.\d+)?)\s*PCS\s+([\d,]+\.\d+)\s*PCS",
         re.I
@@ -119,11 +111,8 @@ def parse(text):
     
     for m in pat.finditer(text):
         raw_desc = m.group(1)
-        # Collapse newlines inside description into a single space
         clean_desc = re.sub(r"\s+", " ", raw_desc).strip()
-        # Remove box package multiplier (e.g., 'X 48')
         clean_desc = re.sub(r"\s+X\s+\d+$", "", clean_desc, flags=re.I).strip()
-        
         try:
             qty = int(round(float(m.group(2).replace(",", ""))))
             rate = float(m.group(3).replace(",", ""))
@@ -134,48 +123,40 @@ def parse(text):
     return inv, po, city, items
 
 def match(s, master):
-    clean_s = clean_sku_str(s)
-    if not clean_s:
-        clean_s = norm(s)
-        
-    master_sku_names = master["SKU Name"].tolist()
-    master_clean = [clean_sku_str(x) for x in master_sku_names]
+    inv_norm = norm(s)
+    inv_tokens = extract_variant_tokens(s)
+    master_names = [norm(x) for x in master["SKU Name"]]
 
-    # 1. Direct clean string match
-    if clean_s in master_clean:
-        idx = master_clean.index(clean_s)
+    # 1. Direct exact normalized match
+    if inv_norm in master_names:
+        idx = master_names.index(inv_norm)
         return master.iloc[idx], 100
 
-    # 2. Token Set Ratio Fuzzy Search
-    res = process.extractOne(clean_s, master_clean, scorer=fuzz.token_set_ratio)
-    if res and res[1] >= 60:
-        return master.iloc[res[2]], res[1]
+    # 2. Strict variant token overlap match (prevents tie-breaks on index 0)
+    best_idx = None
+    best_score = -1
 
-    # 3. Fallback search on raw master descriptions
-    res_raw = process.extractOne(norm(s), [norm(x) for x in master_sku_names], scorer=fuzz.token_set_ratio)
-    if res_raw and res_raw[1] >= 60:
-        return master.iloc[res_raw[2]], res_raw[1]
+    for idx, m_name in enumerate(master_names):
+        m_tokens = extract_variant_tokens(m_name)
+        # Check if key variant terms (e.g. OUD, AMBER, BLOOM, SUGAR) overlap
+        token_overlap = len(inv_tokens.intersection(m_tokens))
+        
+        # Combine token_sort_ratio with token overlap weight
+        sort_score = fuzz.token_sort_ratio(inv_norm, m_name)
+        composite_score = sort_score + (token_overlap * 20)
+
+        if composite_score > best_score:
+            best_score = composite_score
+            best_idx = idx
+
+    if best_idx is not None and best_score >= 40:
+        return master.iloc[best_idx], min(100, best_score)
 
     return None, 0
 
-def make_excel(df):
-    b = io.BytesIO()
-    tmp = df.assign(_value=df["Quantity Dispatched (PCS)"] * df["Price of FG (₹/PCS)"])
-    summ = tmp.groupby(["Invoice Number", "City / Destination", "PO Number"], as_index=False).agg(
-        **{
-            "Total Quantity Dispatched (PCS)": ("Quantity Dispatched (PCS)", "sum"),
-            "Taxable FG Value (₹)": ("_value", "sum")
-        }
-    )
-    with pd.ExcelWriter(b, engine="openpyxl") as w:
-        df[OUTPUT_COLUMNS].to_excel(w, index=False, sheet_name="Invoice Details")
-        summ.to_excel(w, index=False, sheet_name="Summary")
-    return b.getvalue()
-
-# Streamlit UI
+# Streamlit Interface
 st.set_page_config(page_title="ADF Invoice OCR → Standard Excel", layout="wide")
 st.title("ADF Invoice OCR → Standard Excel")
-st.caption("Upload your EAN / SKU master and ADF invoices. Reads all line items from Page 1.")
 
 mf = st.file_uploader("1. Upload EAN ↔ SKU Master Excel", type=["xlsx", "xls"])
 pf = st.file_uploader("2. Upload ADF Invoice PDFs", type=["pdf"], accept_multiple_files=True)
@@ -187,8 +168,7 @@ if mf and pf and st.button("🚀 Process Invoices", type="primary"):
         st.error(str(e))
         st.stop()
         
-    rows = []
-    issues = []
+    rows, issues = [], []
     
     for f in pf:
         inv, po, city, items = parse(extract_text(f.read()))
@@ -202,12 +182,9 @@ if mf and pf and st.button("🚀 Process Invoices", type="primary"):
             m, score = match(s, master)
             if m is None:
                 issues.append([f.name, f"Product mapping not found: {s}"])
-                sku = ean = ""
-                fg_name = s
+                sku, ean, fg_name = "", "", s
             else:
                 sku, ean, fg_name = m["SKU Code"], m["EAN"], m["SKU Name"]
-                if score < 85: 
-                    issues.append([f.name, f"Product match {score}%: {s} → {fg_name}"])
             rows.append([sku, ean, fg_name, inv, city, po, q, r])
             
     result = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
@@ -218,17 +195,9 @@ if mf and pf and st.button("🚀 Process Invoices", type="primary"):
     result["Quantity Dispatched (PCS)"] = pd.to_numeric(result["Quantity Dispatched (PCS)"]).astype("Int64")
     result["Price of FG (₹/PCS)"] = pd.to_numeric(result["Price of FG (₹/PCS)"])
     
-    st.success(f"Processed {len(pf)} invoice(s), {len(result)} line items.")
+    st.success(f"Processed {len(pf)} invoice(s), {len(result)} line items extracted.")
     st.dataframe(result, use_container_width=True)
-    st.download_button(
-        "📥 Download Standardized Excel", 
-        make_excel(result), 
-        "ADF_Invoice_Dispatch_Details.xlsx", 
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
     
     if issues: 
-        st.warning("Some items need review.")
+        st.warning("Mapping Warnings:")
         st.dataframe(pd.DataFrame(issues, columns=["File", "Issue"]), use_container_width=True)
-    else: 
-        st.success("✅ All invoices mapped successfully.")
