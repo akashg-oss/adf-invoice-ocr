@@ -44,22 +44,32 @@ def load_master(f):
         out[c] = out[c].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
     return out[(out.EAN != "") & (out["SKU Code"] != "") & (out["SKU Name"] != "")].drop_duplicates()
 
-def extract_text(data):
+def extract_pdf_data(data):
     with pdfplumber.open(io.BytesIO(data)) as pdf:
-        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    if len(re.sub(r"\s+", "", text)) < 250:
+        if not pdf.pages:
+            return "", ""
+        
+        # Extract full document text to safely search header fields
+        full_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        
+        # Target Page 3 (index 2) exclusively for product line items
+        p3_index = 2 if len(pdf.pages) >= 3 else -1
+        p3_text = pdf.pages[p3_index].extract_text() or ""
+        
+    if len(re.sub(r"\s+", "", p3_text)) < 100:
         try:
             import fitz, pytesseract
             from PIL import Image
             doc = fitz.open(stream=data, filetype="pdf")
-            text += "\n" + "\n".join(
-                pytesseract.image_to_string(
-                    Image.open(io.BytesIO(p.get_pixmap(matrix=fitz.Matrix(2,2), alpha=False).tobytes("png")))
-                ) for p in doc
-            )
+            if len(doc) > 0:
+                img_idx = 2 if len(doc) >= 3 else -1
+                p3_text = pytesseract.image_to_string(
+                    Image.open(io.BytesIO(doc[img_idx].get_pixmap(matrix=fitz.Matrix(2,2), alpha=False).tobytes("png")))
+                )
         except Exception: 
             pass
-    return text
+            
+    return full_text, p3_text
 
 def first(patterns, text):
     for p in patterns:
@@ -67,58 +77,79 @@ def first(patterns, text):
         if m: return m.group(1).strip()
     return ""
 
-def parse(text):
-    # Dynamic Invoice Number detection
+def parse(full_text, p3_text):
+    # 1. Invoice Number (exclusively matches invoice pattern, ignoring static headers like "TAX")
     inv = first([
-        r"Invoice\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_]+)",
-        r"\b(ADF/\d{4}-\d{2}/\d+)\b"
-    ], text)
+        r"\b(ADF/\d{4}-\d{2}/\d+)\b",
+        r"Invoice\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_]{5,})"
+    ], full_text)
+    if inv.upper() in ["TAX", "INVOICE", "TAX INVOICE"]:
+        inv = ""
 
-    # Dynamic PO Number detection
+    # 2. PO Number (extracts numeric/alphanumeric PO, ignoring labels like "Dated")
     po = first([
-        r"Buyer[’']?s\s+Order\s+No\.?\s*[:\-]?\s*([A-Z0-9\/\-_]+)",
-        r"PO\s*(?:No|Number)?\.?\s*[:\-]?\s*([A-Z0-9\/\-_]+)"
-    ], text)
+        r"Buyer[’']?s\s+Order\s+No\.?\s*\n?\s*([0-9]{6,})",
+        r"PO\s*(?:No|Number)?\.?\s*[:\-]?\s*([0-9]{6,})",
+        r"Buyer[’']?s\s+Order\s+No\.?\s*[:\-]?\s*([A-Z0-9\/\-_]{5,})"
+    ], full_text)
+    if po.upper() in ["DATED", "DATE"]:
+        po = ""
 
-    # Dynamic Destination / Shipped To extraction
+    # 3. City / Destination (ignores label "(Ship to)")
     dest = first([
-        r"(?:Ship(?:ped)?\s*To|Consignee|Destination|Deliver\s*To)\s*[:\-]?\s*([^\n,]+)",
-        r"Destination\s*\n?\s*([^\n]+)"
-    ], text)
+        r"Destination\s*\n?\s*([^\n\(\)]+)",
+        r"Ship\s*To\s*[:\-]?\s*([A-Za-z\s]{3,})"
+    ], full_text)
+    if "(SHIP TO)" in dest.upper() or dest.upper() in ["SHIP TO", "(SHIP TO)", "DATED"]:
+        dest = ""
 
     d = norm(dest)
     if any(k in d for k in ["GURGAON", "GURUGRAM", "HARYANA"]): dest = "Gurgaon"
     elif any(k in d for k in ["BANGLORE", "BANGALORE"]): dest = "Bangalore"
     elif d in ("KOLKATA", "HOWRAH", "THANE", "MUMBAI", "DELHI"): dest = d.title()
 
-    # Generic Line Item Extractor for dynamic FG descriptions, quantities, and rates
+    # 4. Extract Product Line Items from Page 3 text only
     items = []
-    lines = text.split("\n")
     
-    for line in lines:
-        line_clean = line.strip()
-        if not line_clean:
-            continue
+    # Matches actual item breakdown: FG Name + Quantity (PCS) + Unit Price
+    pat = re.compile(
+        r"(?:33030050\s+)?(FG-PURPLLE-[A-Z0-9\s\-\/\.\&]+?)\s+X\s+\d+\s+(?:33030050\s+)?[\d,]+\.\d+\s*(?:BOX)?\s+([\d,]+\.\d+|\d+)\s*PCS\s+([\d,]+\.\d+|\d+)\s*PCS\s+([\d,]+\.\d+)",
+        re.I
+    )
+    
+    for m in pat.finditer(p3_text):
+        fg_desc = re.sub(r"\s+", " ", m.group(1)).strip()
         
-        # Regex captures: [FG Description] ... [Quantity] ... [Price/Rate]
-        m = re.search(
-            r"([A-Z0-9\s\-\/\.\&]{3,})\s+(?:X\s+\d+\s+)?(?:\d{6,8}\s+)?[\d,]+\.?\d*\s*(?:BOX|PCS|NOS)?\s+([\d,]+(?:\.\d+)?)\s*(?:PCS|BOX|NOS)?\s+([\d,]+\.\d+)", 
-            line_clean, 
-            re.I
-        )
-        if m:
-            fg_desc = re.sub(r"\s+", " ", m.group(1)).strip()
+        # Skip box summary entries
+        if "BOX" in fg_desc.upper() and "PCS" not in fg_desc.upper():
+            continue
             
-            # Filter out generic table header matches
-            if any(h in fg_desc.upper() for h in ["DESCRIPTION", "TOTAL", "SUBTOTAL", "INVOICE", "TAXABLE", "AMOUNT"]):
+        try:
+            qty = int(round(float(m.group(2).replace(",", ""))))
+            rate = float(m.group(4).replace(",", ""))
+            items.append((fg_desc, qty, rate))
+        except ValueError:
+            continue
+
+    # Secondary fallback for lines formatted with alternative space alignments
+    if not items:
+        for line in p3_text.split("\n"):
+            line_clean = line.strip()
+            if not line_clean or ("BOX" in line_clean and "PCS" not in line_clean):
                 continue
-                
-            try:
-                qty = int(round(float(m.group(2).replace(",", ""))))
-                rate = float(m.group(3).replace(",", ""))
-                items.append((fg_desc, qty, rate))
-            except ValueError:
-                continue
+            m = re.search(
+                r"(?:33030050\s+)?(FG-PURPLLE-[A-Z0-9\s\-\/\.\&]+?)\s+X\s+.*?\b([\d,]+(?:\.\d+)?)\s*PCS\s+([\d,]+\.\d+)", 
+                line_clean, 
+                re.I
+            )
+            if m:
+                fg_desc = m.group(1).strip()
+                try:
+                    qty = int(round(float(m.group(2).replace(",", ""))))
+                    rate = float(m.group(3).replace(",", ""))
+                    items.append((fg_desc, qty, rate))
+                except ValueError:
+                    continue
 
     return inv, po, dest, items
 
@@ -126,12 +157,10 @@ def match(s, master):
     clean_s = norm(s)
     norm_master_names = [norm(x) for x in master["SKU Name"]]
 
-    # 1. Direct Exact Match
     if clean_s in norm_master_names:
         idx = norm_master_names.index(clean_s)
         return master.iloc[idx], 100
 
-    # 2. Dynamic Fuzzy Match against full SKU catalog
     res = process.extractOne(clean_s, norm_master_names, scorer=fuzz.token_set_ratio)
     if res and res[1] >= 70:
         return master.iloc[res[2]], res[1]
@@ -153,12 +182,12 @@ def make_excel(df):
     return b.getvalue()
 
 # Streamlit UI
-st.set_page_config(page_title="Invoice OCR → Standard Excel", layout="wide")
-st.title("Invoice OCR → Standard Excel")
-st.caption("Upload your EAN / SKU master and invoices. Extracts dynamic FG names, quantities, invoice numbers, and destination cities.")
+st.set_page_config(page_title="ADF Invoice OCR → Standard Excel", layout="wide")
+st.title("ADF Invoice OCR → Standard Excel")
+st.caption("Upload your EAN / SKU master and ADF invoices. Reads line items from Page 3.")
 
 mf = st.file_uploader("1. Upload EAN ↔ SKU Master Excel", type=["xlsx", "xls"])
-pf = st.file_uploader("2. Upload Invoice PDFs", type=["pdf"], accept_multiple_files=True)
+pf = st.file_uploader("2. Upload ADF Invoice PDFs", type=["pdf"], accept_multiple_files=True)
 
 if mf and pf and st.button("🚀 Process Invoices", type="primary"):
     try: 
@@ -171,12 +200,13 @@ if mf and pf and st.button("🚀 Process Invoices", type="primary"):
     issues = []
     
     for f in pf:
-        inv, po, city, items = parse(extract_text(f.read()))
+        full_text, p3_text = extract_pdf_data(f.read())
+        inv, po, city, items = parse(full_text, p3_text)
         
         if not inv: issues.append([f.name, "Invoice number not detected"])
         if not po: issues.append([f.name, "PO number not detected"])
-        if not city: issues.append([f.name, "City / Shipped To not detected"])
-        if not items: issues.append([f.name, "No line items detected"])
+        if not city: issues.append([f.name, "City / Destination not detected"])
+        if not items: issues.append([f.name, "No line items detected on Page 3"])
         
         for s, q, r in items:
             m, score = match(s, master)
@@ -202,7 +232,7 @@ if mf and pf and st.button("🚀 Process Invoices", type="primary"):
     st.download_button(
         "📥 Download Standardized Excel", 
         make_excel(result), 
-        "Invoice_Dispatch_Details.xlsx", 
+        "ADF_Invoice_Dispatch_Details.xlsx", 
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
     
