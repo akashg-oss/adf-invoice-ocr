@@ -1,231 +1,202 @@
-import difflib
-import io
+import os
 import re
-import numpy as np
+import io
+import logging
 import pandas as pd
-from pdfminer.high_level import extract_text
-import streamlit as st
+import fitz  # PyMuPDF
+import pdfplumber
+from pypdf import PdfReader
+import pytesseract
+from PIL import Image
 
-st.set_page_config(
-    page_title="ADF Invoice OCR & SKU Matcher", layout="wide"
-)
-st.title("📄 ADF Invoice OCR & SKU Matcher")
-
-
-def clean_tokens(text):
-    s = re.sub(r"[^A-Z0-9]", " ", str(text).upper())
-    stop_words = {
-        "FG",
-        "PURPLLE",
-        "PER",
-        "STAY",
-        "EAU",
-        "DE",
-        "PARFUM",
-        "MINI",
-        "FACES",
-        "CANADA",
-        "33030050",
-        "PCS",
-        "BOX",
-        "X",
-        "20ML",
-        "50ML",
-        "100ML",
-    }
-    return [t for t in s.split() if t not in stop_words]
+# Configure logging to catch PDF repair warnings
+logging.basicConfig(level=logging.INFO)
 
 
-def extract_size(text):
-    m = re.search(r"(\d+\s*ML)", str(text), re.IGNORECASE)
-    return m.group(1).upper().replace(" ", "") if m else ""
+def extract_text_robust(pdf_path_or_bytes):
+    """
+    Extracts text from a PDF, resilient to structural corruption,
+    encoding anomalies, missing font maps, and scanned/image-only pages.
+    """
+    text_content = []
+
+    # --- STRATEGY 1: PyMuPDF (Fastest, repairs minor header/xref corruption) ---
+    try:
+        doc = fitz.open(stream=pdf_path_or_bytes, filetype="pdf") if isinstance(pdf_path_or_bytes, bytes) else fitz.open(pdf_path_or_bytes)
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            extracted = page.get_text("text")
+
+            # Fallback to OCR if page has no selectable text
+            if not extracted.strip():
+                extracted = _ocr_page(page)
+
+            text_content.append(f"--- Page {page_num + 1} ---\n{extracted}")
+
+        if any(t.strip() for t in text_content):
+            return "\n".join(text_content)
+    except Exception as e:
+        logging.warning(f"PyMuPDF failed on file: {e}. Falling back to pypdf...")
+
+    # --- STRATEGY 2: pypdf (Handles strict specification bugs & stream defects) ---
+    try:
+        reader = PdfReader(pdf_path_or_bytes if isinstance(pdf_path_or_bytes, str) else io.BytesIO(pdf_path_or_bytes))
+        text_content = []
+        for i, page in enumerate(reader.pages):
+            extracted = page.extract_text() or ""
+            text_content.append(f"--- Page {i + 1} ---\n{extracted}")
+
+        if any(t.strip() for t in text_content):
+            return "\n".join(text_content)
+    except Exception as e:
+        logging.warning(f"pypdf failed: {e}. Falling back to pdfplumber...")
+
+    # --- STRATEGY 3: pdfplumber (Handles layout anomalies & complex encodings) ---
+    try:
+        with pdfplumber.open(pdf_path_or_bytes if isinstance(pdf_path_or_bytes, str) else io.BytesIO(pdf_path_or_bytes)) as pdf:
+            text_content = []
+            for i, page in enumerate(pdf.pages):
+                extracted = page.extract_text() or ""
+                text_content.append(f"--- Page {i + 1} ---\n{extracted}")
+            return "\n".join(text_content)
+    except Exception as e:
+        logging.error(f"All extraction backends failed: {e}")
+        raise RuntimeError("PDF is severely damaged or unreadable.") from e
 
 
-def match_sku(raw_item_desc, df_master):
-    vol = extract_size(raw_item_desc)
-    subset = df_master.copy()
-
-    if vol == "20ML":
-        f = subset["SKU Name"].str.contains("20ml|mini", case=False, na=False)
-        if f.any():
-            subset = subset[f]
-    elif vol == "50ML":
-        f = subset["SKU Name"].str.contains(
-            "50ml", case=False, na=False
-        ) & ~subset["SKU Name"].str.contains(
-            "20ml|mini", case=False, na=False
-        )
-        if f.any():
-            subset = subset[f]
-
-    inv_tokens = clean_tokens(raw_item_desc)
-    inv_str = " ".join(inv_tokens)
-
-    best_row, best_score = None, -1.0
-    for idx, row in subset.iterrows():
-        m_tokens = clean_tokens(row["SKU Name"])
-        m_str = " ".join(m_tokens)
-        seq_ratio = difflib.SequenceMatcher(None, inv_str, m_str).ratio()
-        token_scores = [
-            max(
-                [
-                    difflib.SequenceMatcher(None, it, mt).ratio()
-                    for mt in m_tokens
-                ]
-                or [0]
-            )
-            for it in inv_tokens
-        ]
-        avg_token_score = (
-            sum(token_scores) / len(token_scores) if token_scores else 0
-        )
-        total_score = (seq_ratio * 0.4) + (avg_token_score * 0.6)
-        if total_score > best_score:
-            best_score = total_score
-            best_row = row
-
-    if best_row is not None and best_score >= 0.35:
-        return (
-            best_row["SKU Code"],
-            str(best_row["EAN"]),
-            best_row["SKU Name"],
-            round(best_score, 2),
-        )
-    return "", "", raw_item_desc, 0.0
+def _ocr_page(page):
+    """Fallback OCR method for scanned/image pages using Tesseract."""
+    try:
+        pix = page.get_pixmap(dpi=150)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img)
+    except Exception as e:
+        logging.error(f"OCR failure on page: {e}")
+        return ""
 
 
-def parse_and_match_invoices(pdf_file, df_master):
-    # Read PDF text via pdfminer to avoid pypdf stream decode errors
-    pdf_bytes = io.BytesIO(pdf_file.read())
-    full_text = extract_text(pdf_bytes) or ""
+def extract_perfume_invoice_data(pdf_path):
+    """
+    Parses perfume invoice PDF content to extract metadata and line items.
+    """
+    text = extract_text_robust(pdf_path)
+    if not text.strip():
+        return []
 
-    # Header details
-    inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", full_text, re.IGNORECASE)
-    inv_num = inv_match.group(0) if inv_match else "UNKNOWN"
+    # 1. Invoice Number Extraction
+    inv_match = re.search(r'ADF/\d{4}-\d{2}/\d+', text)
+    invoice_number = inv_match.group(0) if inv_match else ""
 
-    po_match = re.search(
-        r"Buyer(?:'|’|s|\s)*Order\s*No\.?\s*\n?\s*([A-Z0-9/-]+)",
-        full_text,
-        re.IGNORECASE,
-    )
-    po_number = po_match.group(1).strip() if po_match else "UNKNOWN"
+    # 2. PO / Buyer Order Number Extraction
+    po_match = re.search(r'Buyer[\'’s\s]*Order\s*No\.?\s*\n?\s*(\d+)', text, re.IGNORECASE)
+    po_number = po_match.group(1) if po_match else ""
 
-    dest_match = re.search(
-        r"Destination\s*\n?\s*([A-Za-z0-9\s.\-]+?)(?=\n[A-Z][a-z]|\n\n|\nMotor|\nTerms|\Z)",
-        full_text,
-        re.IGNORECASE,
-    )
-    destination = dest_match.group(1).strip() if dest_match else "UNKNOWN"
+    # 3. Destination Extraction
+    dest_match = re.search(r'Destination\s*\n\s*([A-Za-z]+)', text, re.IGNORECASE)
+    destination = dest_match.group(1) if dest_match else ""
 
-    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
-    raw_extracted_rows = []
+    # 4. Extract Line Items
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    fg_indices = [idx for idx, line in enumerate(lines) if 'FG-PURPLLE' in line]
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
+    raw_descriptions = []
+    for idx in fg_indices:
+        line = lines[idx]
+        desc = line
+        j = idx + 1
+        # Stitch multi-line product descriptions
+        while j < len(lines):
+            nxt = lines[j]
+            if any(k in nxt for k in ['STAY', 'ML-', 'OUD', 'AMBER', 'BLOOM', 'SUGAR', 'AFTER', 'DUSK', 'SUNSET', 'TILL', 'DOWN']) or nxt.startswith('-') or 'X ' in nxt:
+                if not re.match(r'^\d+\s+FG-PURPLLE', nxt) and not nxt.startswith('33030050'):
+                    desc += " " + nxt
+                    j += 1
+                else:
+                    break
+            else:
+                break
 
-        # Check for item header or product line
-        sl_match = re.match(r"^(\d+)\s+(FG-PURPLLE-[A-Z0-9-]+)", line)
-        if sl_match:
-            sl_no = sl_match.group(1)
-            desc_parts = [sl_match.group(2)]
+        clean_desc = re.sub(r'^\d+\s+', '', desc).strip()
+        clean_desc = re.sub(r'\s+', ' ', clean_desc)
+        raw_descriptions.append(clean_desc)
 
-            i += 1
-            while i < len(lines) and not re.search(r"\d{8}", lines[i]):
-                if lines[i]:
-                    desc_parts.append(lines[i])
-                i += 1
+    # Deduplicate items in order while filtering incomplete fragments
+    unique_descriptions = []
+    for desc in raw_descriptions:
+        if desc not in unique_descriptions and len(desc) > 15:
+            unique_descriptions.append(desc)
 
-            raw_desc = " ".join(desc_parts)
-            clean_desc = re.sub(
-                r"\s+X\s+\d+$", "", raw_desc, flags=re.IGNORECASE
-            ).strip()
+    # Fallback logic for split-row invoice tables
+    if not unique_descriptions:
+        fragments = [l for l in lines if 'FG-PURPLLE' in l or '-50ML-' in l or '-20ML-' in l]
+        combined = []
+        curr = ""
+        for frag in fragments:
+            if 'FG-PURPLLE' in frag:
+                curr = re.sub(r'^\d+\s+', '', frag)
+            elif curr:
+                curr += " " + frag
+                combined.append(re.sub(r'\s+', ' ', curr))
+                curr = ""
+        unique_descriptions = list(dict.fromkeys(combined))
 
-            sku_code, ean, sku_name, score = match_sku(clean_desc, df_master)
+    # Parse individual item columns
+    records = []
+    for idx, desc in enumerate(unique_descriptions, start=1):
+        pack_m = re.search(r'X\s*(\d+)', desc, re.IGNORECASE)
+        pack_size = pack_m.group(1) if pack_m else "1"
 
-            raw_extracted_rows.append({
-                "Sl No": sl_no,
-                "SKU Code": sku_code,
-                "EAN": ean,
-                "Name of FG": sku_name if sku_code else clean_desc,
-                "Invoice Number": inv_num,
-                "PO Number": po_number,
-                "Destination": destination,
-                "Match Score": score,
-            })
-        i += 1
+        size_m = re.search(r'(\d+\s*ML)', desc, re.IGNORECASE)
+        size = size_m.group(1).replace(" ", "") if size_m else ""
 
-    df_res = pd.DataFrame(raw_extracted_rows)
+        frag_m = re.search(r'STAY[ -]?([A-Z\s]+?)(?=\s*X\s*\d+|$)', desc)
+        fragrance = "STAY " + frag_m.group(1).strip() if frag_m else desc
 
-    if df_res.empty:
-        return df_res
+        sku_code = desc.split()[0] if desc else ""
 
-    # 1. Extract category/group header text where SKU Code is empty
-    df_res["Category / Raw Group"] = np.where(
-        df_res["SKU Code"].isna() | (df_res["SKU Code"] == ""),
-        df_res["Name of FG"],
-        np.nan,
-    )
+        records.append({
+            "Sl No": idx,
+            "Invoice Number": invoice_number,
+            "PO Number": po_number,
+            "Destination": destination,
+            "SKU Code": sku_code,
+            "Fragrance Name": fragrance,
+            "Size": size,
+            "Pack Size": pack_size,
+            "Full Description": desc
+        })
 
-    # 2. Forward-fill category headers across child rows
-    df_res["Category / Raw Group"] = df_res["Category / Raw Group"].ffill()
-
-    # 3. Filter out group header rows (keep valid SKU entries)
-    df_cleaned = df_res[
-        df_res["SKU Code"].notna() & (df_res["SKU Code"] != "")
-    ].reset_index(drop=True)
-
-    # 4. Drop 'Sl No' and order final columns
-    final_cols = [
-        "Category / Raw Group",
-        "SKU Code",
-        "EAN",
-        "Name of FG",
-        "Invoice Number",
-        "PO Number",
-        "Destination",
-        "Match Score",
-    ]
-
-    return df_cleaned[[c for c in final_cols if c in df_cleaned.columns]]
+    return records
 
 
-# Streamlit Interface
-st.sidebar.header("📁 File Uploads")
-uploaded_excel = st.sidebar.file_uploader(
-    "Upload Master SKU Excel", type=["xlsx", "xls"]
-)
-uploaded_pdfs = st.sidebar.file_uploader(
-    "Upload Invoice PDFs", type=["pdf"], accept_multiple_files=True
-)
+def batch_process_invoices(directory_path, output_excel="Perfume_Invoices_Extracted.xlsx"):
+    """
+    Processes all PDFs in a folder and saves the consolidated data into an Excel spreadsheet.
+    """
+    all_records = []
+    pdf_files = [f for f in os.listdir(directory_path) if f.lower().endswith('.pdf')]
 
-if uploaded_excel and uploaded_pdfs:
-    df_master = pd.read_excel(uploaded_excel)
+    logging.info(f"Found {len(pdf_files)} PDF file(s) to process.")
 
-    if st.button("Process Invoices"):
-        all_dfs = []
-        for pdf_file in uploaded_pdfs:
-            df_res = parse_and_match_invoices(pdf_file, df_master)
-            if not df_res.empty:
-                all_dfs.append(df_res)
+    for file_name in pdf_files:
+        full_path = os.path.join(directory_path, file_name)
+        logging.info(f"Processing invoice: {file_name}")
+        records = extract_perfume_invoice_data(full_path)
+        all_records.extend(records)
 
-        if all_dfs:
-            final_df = pd.concat(all_dfs, ignore_index=True)
-            st.success(
-                f"Successfully extracted and matched {len(final_df)} items across {len(uploaded_pdfs)} invoice(s)."
-            )
-            st.dataframe(final_df, use_container_width=True)
+    if not all_records:
+        logging.warning("No records extracted.")
+        return None
 
-            csv_data = final_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="📥 Download Extracted Results CSV",
-                data=csv_data,
-                file_name="extracted_invoice_matches.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("No line items could be extracted from the uploaded PDFs.")
-elif not uploaded_excel:
-    st.info("👈 Please upload the Master SKU Excel file in the sidebar.")
-elif not uploaded_pdfs:
-    st.info("👈 Please upload Invoice PDFs in the sidebar.")
+    df = pd.DataFrame(all_records)
+    df.to_excel(output_excel, index=False)
+    logging.info(f"Successfully exported data to {output_excel}")
+    return df
+
+
+if __name__ == "__main__":
+    # Specify folder directory containing your perfume PDFs
+    process_directory = "." 
+    result_df = batch_process_invoices(process_directory)
+    if result_df is not None:
+        print(result_df)
