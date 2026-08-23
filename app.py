@@ -4,7 +4,6 @@ import logging
 import pandas as pd
 import streamlit as st
 import fitz  # PyMuPDF
-import pdfplumber
 from pypdf import PdfReader
 import pytesseract
 from PIL import Image
@@ -15,27 +14,30 @@ logging.basicConfig(level=logging.INFO)
 
 # --- STRATEGY: Robust PDF Text Extraction ---
 def extract_text_robust(pdf_bytes):
-    """Extracts text from PDF bytes using PyMuPDF, pypdf, pdfplumber, and OCR fallbacks."""
+    """Extracts line-sorted text from PDF bytes using PyMuPDF, pypdf, and OCR fallbacks."""
     text_content = []
 
-    # 1. PyMuPDF
+    # 1. PyMuPDF with vertical position sorting
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for page_num in range(len(doc)):
             page = doc[page_num]
-            extracted = page.get_text("text")
+            # Sort text blocks top-to-bottom, left-to-right
+            blocks = page.get_text("blocks", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+            blocks.sort(key=lambda b: (b[1], b[0]))
+            
+            page_text = "\n".join([b[4] for b in blocks if b[4].strip()])
+            if not page_text.strip():
+                page_text = _ocr_page(page)
 
-            if not extracted.strip():
-                extracted = _ocr_page(page)
-
-            text_content.append(f"--- Page {page_num + 1} ---\n{extracted}")
+            text_content.append(f"--- Page {page_num + 1} ---\n{page_text}")
 
         if any(t.strip() for t in text_content):
             return "\n".join(text_content)
     except Exception as e:
         logging.warning(f"PyMuPDF failed: {e}. Falling back to pypdf...")
 
-    # 2. pypdf
+    # 2. pypdf Fallback
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         text_content = []
@@ -46,19 +48,9 @@ def extract_text_robust(pdf_bytes):
         if any(t.strip() for t in text_content):
             return "\n".join(text_content)
     except Exception as e:
-        logging.warning(f"pypdf failed: {e}. Falling back to pdfplumber...")
+        logging.warning(f"pypdf failed: {e}")
 
-    # 3. pdfplumber
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            text_content = []
-            for i, page in enumerate(pdf.pages):
-                extracted = page.extract_text() or ""
-                text_content.append(f"--- Page {i + 1} ---\n{extracted}")
-            return "\n".join(text_content)
-    except Exception as e:
-        logging.error(f"All extraction backends failed: {e}")
-        return ""
+    return ""
 
 
 def _ocr_page(page):
@@ -84,14 +76,6 @@ def match_master_sku(extracted_text, size_val, master_df):
     desc_clean = re.sub(r'[^A-Z0-9]', ' ', str(extracted_text).upper())
     size_clean = re.sub(r'[^A-Z0-9]', '', str(size_val).upper())  # e.g., "20ML"
 
-    # 1. Exact SKU Code or EAN match in text
-    for _, row in master_df.iterrows():
-        m_sku = str(row.get('SKU Code', '')).strip()
-        m_ean = str(row.get('EAN', '')).strip()
-        if (m_sku and m_sku.upper() in desc_clean) or (m_ean and m_ean in desc_clean):
-            return m_sku, m_ean
-
-    # 2. Key fragrance term matching from SKU Name
     best_match = ("", "")
     best_score = 0
 
@@ -100,7 +84,7 @@ def match_master_sku(extracted_text, size_val, master_df):
         m_ean = str(row.get('EAN', '')).strip()
         m_name = str(row.get('SKU Name', '')).upper()
 
-        # Check bottle size
+        # Size check
         m_size = ""
         if "20ML" in m_name or "MINI" in m_name:
             m_size = "20ML"
@@ -112,7 +96,11 @@ def match_master_sku(extracted_text, size_val, master_df):
         if size_clean and m_size and size_clean != m_size:
             continue
 
-        # Extract brand-agnostic keywords from master SKU Name
+        # Exact SKU Code or EAN match in text
+        if (m_sku and m_sku.upper() in desc_clean) or (m_ean and m_ean in desc_clean):
+            return m_sku, m_ean
+
+        # Extract keywords for fuzzy match
         words = set(re.findall(r'[A-Z]{3,}', m_name)) - {'FACES', 'CANADA', 'EAU', 'PARFUM', 'MINI'}
         score = sum(1 for w in words if w in desc_clean)
 
@@ -137,63 +125,84 @@ def extract_perfume_invoice_data(pdf_bytes, file_name, master_df):
     if not text.strip():
         return []
 
-    # 1. Header Metadata Extraction
-    inv_match = re.search(r'ADF/\d{4}-\d{2}/\d+', text)
+    # Filter out e-Way Bill pages to prevent duplicate/invalid parsing
+    pages = text.split("--- Page ")
+    tax_invoice_pages = [p for p in pages if "TAX INVOICE" in p and "e-Way Bill" not in p]
+    invoice_text = "\n".join(tax_invoice_pages) if tax_invoice_pages else text
+
+    # Header Metadata Extraction
+    inv_match = re.search(r'ADF/\d{4}-\d{2}/\d+', invoice_text)
     invoice_number = inv_match.group(0) if inv_match else ""
 
-    po_match = re.search(r'Buyer[\'’s\s]*Order\s*No\.?\s*(\d+)', text, re.IGNORECASE)
+    po_match = re.search(r'Buyer[\'’s\s]*Order\s*No\.?\s*(\d+)', invoice_text, re.IGNORECASE)
     po_number = po_match.group(1) if po_match else ""
 
-    dest_match = re.search(r'Destination\s*[:\n]\s*([A-Za-z]+)', text, re.IGNORECASE)
+    dest_match = re.search(r'Destination\s*[:\n\s]*([A-Za-z]+)', invoice_text, re.IGNORECASE)
     destination = dest_match.group(1) if dest_match else ""
 
-    # 2. Line Items Extraction
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    # Stitch multi-line line items
+    raw_lines = [l.strip() for l in invoice_text.split('\n') if l.strip()]
+    structured_items = []
+    current_item = ""
+
+    for line in raw_lines:
+        # Detect start of new item row
+        if re.match(r'^\d+\s+FG-PURPLLE', line) or 'FG-PURPLLE' in line:
+            if current_item:
+                structured_items.append(current_item)
+            current_item = line
+        elif current_item and any(k in line for k in ['STAY', '-20ML-', '-50ML-', '-100ML-', 'UNTIL', 'AFTER', 'TILL', 'X ']):
+            current_item += " " + line
+        elif current_item and not any(k in line for k in ['Total', 'Amount', 'IGST', 'Subtotal', 'Taxable']):
+            if re.search(r'X\s*\d+', line):
+                current_item += " " + line
+                structured_items.append(current_item)
+                current_item = ""
+
+    if current_item:
+        structured_items.append(current_item)
+
     records = []
     sl_no = 1
 
-    for line in lines:
-        if any(k in line for k in ['FG-PURPLLE', 'STAY ', 'AURA ', '-20ML-', '-50ML-', '-100ML-']):
-            # Pack Size (e.g. X 48 or X 36)
-            pack_m = re.search(r'X\s*(\d+)', line, re.IGNORECASE)
-            pack_size = pack_m.group(1) if pack_m else "1"
+    for item_str in structured_items:
+        # Pack Size (e.g., X 48 or X 36)
+        pack_m = re.search(r'X\s*(\d+)', item_str, re.IGNORECASE)
+        pack_size = pack_m.group(1) if pack_m else "1"
 
-            # Size (e.g. 20ML, 50ML, 100ML)
-            size_m = re.search(r'(\d+\s*ML)', line, re.IGNORECASE)
-            size = size_m.group(1).replace(" ", "").upper() if size_m else ""
+        # Size (e.g., 20ML, 50ML, 100ML)
+        size_m = re.search(r'(\d+\s*ML)', item_str, re.IGNORECASE)
+        size = size_m.group(1).replace(" ", "").upper() if size_m else ""
 
-            # Unit Price / Rate
-            prices = re.findall(r'\b\d+\.\d{2}\b', line)
-            unit_price = prices[-2] if len(prices) >= 2 else (prices[0] if prices else "")
+        # Unit Price / Rate
+        prices = re.findall(r'\b\d+\.\d{2}\b', item_str)
+        unit_price = prices[-2] if len(prices) >= 2 else (prices[0] if prices else "")
 
-            # Number of Units / Quantity
-            qty_match = re.search(r'(\d+)\s*(?:Pcs|Nos|Units|Qty|PCS|NOS)', line, re.IGNORECASE)
-            if qty_match:
-                num_units = qty_match.group(1)
-            else:
-                clean_line = re.sub(r'3303\d{4}', '', line)
-                clean_line = re.sub(r'\b\d+\.\d{2}\b', '', clean_line)
-                integers = re.findall(r'\b\d+\b', clean_line)
-                valid_ints = [i for i in integers if int(i) > 0 and len(i) <= 5]
-                num_units = valid_ints[-1] if valid_ints else ""
+        # Quantity / Number of Units
+        pcs_match = re.search(r'([\d,]+\.\d{4})\s*PCS', item_str, re.IGNORECASE)
+        if pcs_match:
+            num_units = str(int(float(pcs_match.group(1).replace(',', ''))))
+        else:
+            qty_match = re.search(r'(\d+)\s*(?:Pcs|Nos|Units|Qty|PCS|NOS)', item_str, re.IGNORECASE)
+            num_units = qty_match.group(1) if qty_match else ""
 
-            # Master SKU & EAN Lookup from Master Excel
-            sku_code, ean_code = match_master_sku(line, size, master_df)
+        # Master SKU & EAN Lookup
+        sku_code, ean_code = match_master_sku(item_str, size, master_df)
 
-            records.append({
-                "File Name": file_name,
-                "Sl No": sl_no,
-                "Invoice Number": invoice_number,
-                "PO Number": po_number,
-                "Destination": destination,
-                "SKU Code": sku_code,
-                "EAN Code": ean_code,
-                "Size": size,
-                "Pack Size": pack_size,
-                "Unit Price": unit_price,
-                "Number of Units": num_units
-            })
-            sl_no += 1
+        records.append({
+            "File Name": file_name,
+            "Sl No": sl_no,
+            "Invoice Number": invoice_number,
+            "PO Number": po_number,
+            "Destination": destination,
+            "SKU Code": sku_code,
+            "EAN Code": ean_code,
+            "Size": size,
+            "Pack Size": pack_size,
+            "Unit Price": unit_price,
+            "Number of Units": num_units
+        })
+        sl_no += 1
 
     return records
 
@@ -240,7 +249,9 @@ if uploaded_pdfs:
     if all_data:
         df = pd.DataFrame(all_data)
 
-        # Output Order: File Name, Sl No, Invoice Number, PO Number, Destination, SKU Code, EAN Code, Size, Pack Size, Unit Price, Number of Units
+        # Drop any empty/NaN rows and sanitize
+        df = df.dropna(how='all')
+
         columns_order = [
             "File Name", "Sl No", "Invoice Number", "PO Number", "Destination",
             "SKU Code", "EAN Code", "Size", "Pack Size", "Unit Price", "Number of Units"
@@ -252,14 +263,23 @@ if uploaded_pdfs:
         # Display Data Grid
         st.dataframe(df, use_container_width=True)
 
-        # Generate Downloadable Excel File
+        # Download CSV option (without empty lines)
+        csv_data = df.to_csv(index=False, lineterminator='\n').encode('utf-8')
+        st.download_button(
+            label="Download CSV (.csv)",
+            data=csv_data,
+            file_name="Extracted_Perfume_Invoices.csv",
+            mime="text/csv"
+        )
+
+        # Download Excel option
         output_buffer = io.BytesIO()
         with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='Summary')
         excel_data = output_buffer.getvalue()
 
         st.download_button(
-            label="Download Final Excel (.xlsx)",
+            label="Download Excel (.xlsx)",
             data=excel_data,
             file_name="Extracted_Perfume_Invoices.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
