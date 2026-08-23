@@ -12,17 +12,13 @@ st.set_page_config(page_title="Perfume Invoice & Master SKU Extractor", layout="
 logging.basicConfig(level=logging.INFO)
 
 
-# --- STRATEGY: Robust PDF Text Extraction ---
-def extract_text_robust(pdf_bytes):
-    """Extracts line-sorted text from PDF bytes using PyMuPDF, pypdf, and OCR fallbacks."""
-    text_content = []
-
-    # 1. PyMuPDF with vertical position sorting
+# --- STRATEGY: Robust PDF Text Extraction (PAGE 1 ONLY) ---
+def extract_text_page1(pdf_bytes):
+    """Extracts line-sorted text strictly from Page 1 of the PDF bytes."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            # Sort text blocks top-to-bottom, left-to-right
+        if len(doc) > 0:
+            page = doc[0]  # Focus exclusively on Page 1
             blocks = page.get_text("blocks", flags=fitz.TEXT_PRESERVE_WHITESPACE)
             blocks.sort(key=lambda b: (b[1], b[0]))
             
@@ -30,23 +26,15 @@ def extract_text_robust(pdf_bytes):
             if not page_text.strip():
                 page_text = _ocr_page(page)
 
-            text_content.append(f"--- Page {page_num + 1} ---\n{page_text}")
-
-        if any(t.strip() for t in text_content):
-            return "\n".join(text_content)
+            return page_text
     except Exception as e:
         logging.warning(f"PyMuPDF failed: {e}. Falling back to pypdf...")
 
-    # 2. pypdf Fallback
+    # pypdf Fallback for Page 1
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        text_content = []
-        for i, page in enumerate(reader.pages):
-            extracted = page.extract_text() or ""
-            text_content.append(f"--- Page {i + 1} ---\n{extracted}")
-
-        if any(t.strip() for t in text_content):
-            return "\n".join(text_content)
+        if len(reader.pages) > 0:
+            return reader.pages[0].extract_text() or ""
     except Exception as e:
         logging.warning(f"pypdf failed: {e}")
 
@@ -74,7 +62,7 @@ def match_master_sku(extracted_text, size_val, master_df):
         return "", ""
 
     desc_clean = re.sub(r'[^A-Z0-9]', ' ', str(extracted_text).upper())
-    size_clean = re.sub(r'[^A-Z0-9]', '', str(size_val).upper())  # e.g., "20ML"
+    size_clean = re.sub(r'[^A-Z0-9]', '', str(size_val).upper())
 
     best_match = ("", "")
     best_score = 0
@@ -104,7 +92,6 @@ def match_master_sku(extracted_text, size_val, master_df):
         words = set(re.findall(r'[A-Z]{3,}', m_name)) - {'FACES', 'CANADA', 'EAU', 'PARFUM', 'MINI'}
         score = sum(1 for w in words if w in desc_clean)
 
-        # Handle specific common typos (e.g., TILL DOWN vs TILL DAWN)
         if "DAWN" in words and ("DAWN" in desc_clean or "DOWN" in desc_clean):
             score += 1
 
@@ -118,17 +105,12 @@ def match_master_sku(extracted_text, size_val, master_df):
     return "", ""
 
 
-# --- INVOICE PARSER ---
+# --- INVOICE PARSER (PAGE 1 ONLY) ---
 def extract_perfume_invoice_data(pdf_bytes, file_name, master_df):
-    """Parses perfume invoice PDF and maps extracted line items to Master Excel data."""
-    text = extract_text_robust(pdf_bytes)
-    if not text.strip():
+    """Parses Page 1 of perfume invoice PDF and maps line items to Master Excel data."""
+    invoice_text = extract_text_page1(pdf_bytes)
+    if not invoice_text.strip():
         return []
-
-    # Filter out e-Way Bill pages to prevent duplicate/invalid parsing
-    pages = text.split("--- Page ")
-    tax_invoice_pages = [p for p in pages if "TAX INVOICE" in p and "e-Way Bill" not in p]
-    invoice_text = "\n".join(tax_invoice_pages) if tax_invoice_pages else text
 
     # Header Metadata Extraction
     inv_match = re.search(r'ADF/\d{4}-\d{2}/\d+', invoice_text)
@@ -140,32 +122,26 @@ def extract_perfume_invoice_data(pdf_bytes, file_name, master_df):
     dest_match = re.search(r'Destination\s*[:\n\s]*([A-Za-z]+)', invoice_text, re.IGNORECASE)
     destination = dest_match.group(1) if dest_match else ""
 
-    # Stitch multi-line line items
-    raw_lines = [l.strip() for l in invoice_text.split('\n') if l.strip()]
-    structured_items = []
-    current_item = ""
+    # Precise table row regex targeting Billed PCS, Unit Rate, and Total Amount
+    row_pattern = re.compile(
+        r'([\d,]+\.\d{4})\s*PCS\s+([\d,]+\.\d{2})\s+PCS\s+([\d,]+\.\d{2})',
+        re.IGNORECASE
+    )
 
-    for line in raw_lines:
-        # Detect start of new item row
-        if re.match(r'^\d+\s+FG-PURPLLE', line) or 'FG-PURPLLE' in line:
-            if current_item:
-                structured_items.append(current_item)
-            current_item = line
-        elif current_item and any(k in line for k in ['STAY', '-20ML-', '-50ML-', '-100ML-', 'UNTIL', 'AFTER', 'TILL', 'X ']):
-            current_item += " " + line
-        elif current_item and not any(k in line for k in ['Total', 'Amount', 'IGST', 'Subtotal', 'Taxable']):
-            if re.search(r'X\s*\d+', line):
-                current_item += " " + line
-                structured_items.append(current_item)
-                current_item = ""
-
-    if current_item:
-        structured_items.append(current_item)
+    matches = list(row_pattern.finditer(invoice_text))
+    desc_matches = re.findall(r'FG-PURPLLE-PER[^\n]*', invoice_text)
 
     records = []
-    sl_no = 1
+    for idx, match in enumerate(matches, start=1):
+        # Number of Units (Billed PCS)
+        num_units_raw = match.group(1).replace(',', '')
+        num_units = str(int(float(num_units_raw)))
 
-    for item_str in structured_items:
+        # Unit Price / Rate
+        unit_price = match.group(2).replace(',', '')
+
+        item_str = desc_matches[idx - 1] if idx - 1 < len(desc_matches) else ""
+
         # Pack Size (e.g., X 48 or X 36)
         pack_m = re.search(r'X\s*(\d+)', item_str, re.IGNORECASE)
         pack_size = pack_m.group(1) if pack_m else "1"
@@ -174,24 +150,12 @@ def extract_perfume_invoice_data(pdf_bytes, file_name, master_df):
         size_m = re.search(r'(\d+\s*ML)', item_str, re.IGNORECASE)
         size = size_m.group(1).replace(" ", "").upper() if size_m else ""
 
-        # Unit Price / Rate
-        prices = re.findall(r'\b\d+\.\d{2}\b', item_str)
-        unit_price = prices[-2] if len(prices) >= 2 else (prices[0] if prices else "")
-
-        # Quantity / Number of Units
-        pcs_match = re.search(r'([\d,]+\.\d{4})\s*PCS', item_str, re.IGNORECASE)
-        if pcs_match:
-            num_units = str(int(float(pcs_match.group(1).replace(',', ''))))
-        else:
-            qty_match = re.search(r'(\d+)\s*(?:Pcs|Nos|Units|Qty|PCS|NOS)', item_str, re.IGNORECASE)
-            num_units = qty_match.group(1) if qty_match else ""
-
         # Master SKU & EAN Lookup
         sku_code, ean_code = match_master_sku(item_str, size, master_df)
 
         records.append({
             "File Name": file_name,
-            "Sl No": sl_no,
+            "Sl No": idx,
             "Invoice Number": invoice_number,
             "PO Number": po_number,
             "Destination": destination,
@@ -202,7 +166,6 @@ def extract_perfume_invoice_data(pdf_bytes, file_name, master_df):
             "Unit Price": unit_price,
             "Number of Units": num_units
         })
-        sl_no += 1
 
     return records
 
@@ -240,7 +203,7 @@ if uploaded_pdfs:
         st.warning("No Master SKU File uploaded. 'SKU Code' and 'EAN Code' lookup will be empty.")
 
     all_data = []
-    with st.spinner("Processing PDF invoices..."):
+    with st.spinner("Processing Page 1 of PDF invoices..."):
         for pdf_file in uploaded_pdfs:
             bytes_data = pdf_file.read()
             records = extract_perfume_invoice_data(bytes_data, pdf_file.name, master_df)
@@ -249,7 +212,7 @@ if uploaded_pdfs:
     if all_data:
         df = pd.DataFrame(all_data)
 
-        # Drop any empty/NaN rows and sanitize
+        # Drop empty rows and sanitize
         df = df.dropna(how='all')
 
         columns_order = [
@@ -258,12 +221,12 @@ if uploaded_pdfs:
         ]
         df = df.reindex(columns=columns_order)
 
-        st.success(f"Successfully extracted {len(df)} item rows from {len(uploaded_pdfs)} invoice(s)!")
+        st.success(f"Successfully extracted {len(df)} item rows from Page 1 of {len(uploaded_pdfs)} invoice(s)!")
 
         # Display Data Grid
         st.dataframe(df, use_container_width=True)
 
-        # Download CSV option (without empty lines)
+        # Download CSV option
         csv_data = df.to_csv(index=False, lineterminator='\n').encode('utf-8')
         st.download_button(
             label="Download CSV (.csv)",
@@ -285,4 +248,4 @@ if uploaded_pdfs:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.error("Could not extract any matching invoice items from the uploaded PDF(s).")
+        st.error("Could not extract any matching invoice items from Page 1 of the uploaded PDF(s).")
