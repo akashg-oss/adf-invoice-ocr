@@ -8,3 +8,8 @@ Pillow
 rapidfuzz
 pypdf
 pdfminer.six
+PyMuPDF 
+pypdf
+pdfplumber
+pytesseract
+Pillow
