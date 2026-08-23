@@ -1,33 +1,33 @@
-import os
-import re
 import io
+import re
 import logging
 import pandas as pd
+import streamlit as st
 import fitz  # PyMuPDF
 import pdfplumber
 from pypdf import PdfReader
 import pytesseract
 from PIL import Image
 
-# Configure logging to catch PDF repair warnings
+st.set_page_config(page_title="Perfume Invoice Data Extractor", layout="wide")
+
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 
 
-def extract_text_robust(pdf_path_or_bytes):
+def extract_text_robust(pdf_bytes):
     """
-    Extracts text from a PDF, resilient to structural corruption,
-    encoding anomalies, missing font maps, and scanned/image-only pages.
+    Extracts text from PDF bytes using PyMuPDF, pypdf, pdfplumber, and OCR fallbacks.
     """
     text_content = []
 
-    # --- STRATEGY 1: PyMuPDF (Fastest, repairs minor header/xref corruption) ---
+    # --- STRATEGY 1: PyMuPDF ---
     try:
-        doc = fitz.open(stream=pdf_path_or_bytes, filetype="pdf") if isinstance(pdf_path_or_bytes, bytes) else fitz.open(pdf_path_or_bytes)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for page_num in range(len(doc)):
             page = doc[page_num]
             extracted = page.get_text("text")
 
-            # Fallback to OCR if page has no selectable text
             if not extracted.strip():
                 extracted = _ocr_page(page)
 
@@ -36,11 +36,11 @@ def extract_text_robust(pdf_path_or_bytes):
         if any(t.strip() for t in text_content):
             return "\n".join(text_content)
     except Exception as e:
-        logging.warning(f"PyMuPDF failed on file: {e}. Falling back to pypdf...")
+        logging.warning(f"PyMuPDF failed: {e}. Falling back to pypdf...")
 
-    # --- STRATEGY 2: pypdf (Handles strict specification bugs & stream defects) ---
+    # --- STRATEGY 2: pypdf ---
     try:
-        reader = PdfReader(pdf_path_or_bytes if isinstance(pdf_path_or_bytes, str) else io.BytesIO(pdf_path_or_bytes))
+        reader = PdfReader(io.BytesIO(pdf_bytes))
         text_content = []
         for i, page in enumerate(reader.pages):
             extracted = page.extract_text() or ""
@@ -51,9 +51,9 @@ def extract_text_robust(pdf_path_or_bytes):
     except Exception as e:
         logging.warning(f"pypdf failed: {e}. Falling back to pdfplumber...")
 
-    # --- STRATEGY 3: pdfplumber (Handles layout anomalies & complex encodings) ---
+    # --- STRATEGY 3: pdfplumber ---
     try:
-        with pdfplumber.open(pdf_path_or_bytes if isinstance(pdf_path_or_bytes, str) else io.BytesIO(pdf_path_or_bytes)) as pdf:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text_content = []
             for i, page in enumerate(pdf.pages):
                 extracted = page.extract_text() or ""
@@ -61,7 +61,7 @@ def extract_text_robust(pdf_path_or_bytes):
             return "\n".join(text_content)
     except Exception as e:
         logging.error(f"All extraction backends failed: {e}")
-        raise RuntimeError("PDF is severely damaged or unreadable.") from e
+        return ""
 
 
 def _ocr_page(page):
@@ -71,15 +71,15 @@ def _ocr_page(page):
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         return pytesseract.image_to_string(img)
     except Exception as e:
-        logging.error(f"OCR failure on page: {e}")
+        logging.error(f"OCR failure: {e}")
         return ""
 
 
-def extract_perfume_invoice_data(pdf_path):
+def extract_perfume_invoice_data(pdf_bytes, file_name):
     """
     Parses perfume invoice PDF content to extract metadata and line items.
     """
-    text = extract_text_robust(pdf_path)
+    text = extract_text_robust(pdf_bytes)
     if not text.strip():
         return []
 
@@ -87,7 +87,7 @@ def extract_perfume_invoice_data(pdf_path):
     inv_match = re.search(r'ADF/\d{4}-\d{2}/\d+', text)
     invoice_number = inv_match.group(0) if inv_match else ""
 
-    # 2. PO / Buyer Order Number Extraction
+    # 2. PO Number Extraction
     po_match = re.search(r'Buyer[\'’s\s]*Order\s*No\.?\s*\n?\s*(\d+)', text, re.IGNORECASE)
     po_number = po_match.group(1) if po_match else ""
 
@@ -104,7 +104,6 @@ def extract_perfume_invoice_data(pdf_path):
         line = lines[idx]
         desc = line
         j = idx + 1
-        # Stitch multi-line product descriptions
         while j < len(lines):
             nxt = lines[j]
             if any(k in nxt for k in ['STAY', 'ML-', 'OUD', 'AMBER', 'BLOOM', 'SUGAR', 'AFTER', 'DUSK', 'SUNSET', 'TILL', 'DOWN']) or nxt.startswith('-') or 'X ' in nxt:
@@ -120,13 +119,11 @@ def extract_perfume_invoice_data(pdf_path):
         clean_desc = re.sub(r'\s+', ' ', clean_desc)
         raw_descriptions.append(clean_desc)
 
-    # Deduplicate items in order while filtering incomplete fragments
     unique_descriptions = []
     for desc in raw_descriptions:
         if desc not in unique_descriptions and len(desc) > 15:
             unique_descriptions.append(desc)
 
-    # Fallback logic for split-row invoice tables
     if not unique_descriptions:
         fragments = [l for l in lines if 'FG-PURPLLE' in l or '-50ML-' in l or '-20ML-' in l]
         combined = []
@@ -140,7 +137,6 @@ def extract_perfume_invoice_data(pdf_path):
                 curr = ""
         unique_descriptions = list(dict.fromkeys(combined))
 
-    # Parse individual item columns
     records = []
     for idx, desc in enumerate(unique_descriptions, start=1):
         pack_m = re.search(r'X\s*(\d+)', desc, re.IGNORECASE)
@@ -155,6 +151,7 @@ def extract_perfume_invoice_data(pdf_path):
         sku_code = desc.split()[0] if desc else ""
 
         records.append({
+            "File Name": file_name,
             "Sl No": idx,
             "Invoice Number": invoice_number,
             "PO Number": po_number,
@@ -169,34 +166,42 @@ def extract_perfume_invoice_data(pdf_path):
     return records
 
 
-def batch_process_invoices(directory_path, output_excel="Perfume_Invoices_Extracted.xlsx"):
-    """
-    Processes all PDFs in a folder and saves the consolidated data into an Excel spreadsheet.
-    """
-    all_records = []
-    pdf_files = [f for f in os.listdir(directory_path) if f.lower().endswith('.pdf')]
+# Streamlit UI
+st.title("Perfume PDF Invoice Extractor")
+st.write("Upload your PDF invoices below to extract items into structured table data.")
 
-    logging.info(f"Found {len(pdf_files)} PDF file(s) to process.")
+uploaded_files = st.file_uploader(
+    "Choose PDF Invoices", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
 
-    for file_name in pdf_files:
-        full_path = os.path.join(directory_path, file_name)
-        logging.info(f"Processing invoice: {file_name}")
-        records = extract_perfume_invoice_data(full_path)
-        all_records.extend(records)
+if uploaded_files:
+    all_data = []
+    with st.spinner("Processing PDF invoices..."):
+        for uploaded_file in uploaded_files:
+            bytes_data = uploaded_file.read()
+            records = extract_perfume_invoice_data(bytes_data, uploaded_file.name)
+            all_data.extend(records)
 
-    if not all_records:
-        logging.warning("No records extracted.")
-        return None
+    if all_data:
+        df = pd.DataFrame(all_data)
+        st.success(f"Successfully processed {len(uploaded_files)} PDF file(s)!")
+        
+        # Display data grid
+        st.dataframe(df, use_container_width=True)
 
-    df = pd.DataFrame(all_records)
-    df.to_excel(output_excel, index=False)
-    logging.info(f"Successfully exported data to {output_excel}")
-    return df
+        # Convert to Excel stream for download
+        output_buffer = io.BytesIO()
+        with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Summary')
+        excel_data = output_buffer.getvalue()
 
-
-if __name__ == "__main__":
-    # Specify folder directory containing your perfume PDFs
-    process_directory = "." 
-    result_df = batch_process_invoices(process_directory)
-    if result_df is not None:
-        print(result_df)
+        st.download_button(
+            label="Download Data as Excel (.xlsx)",
+            data=excel_data,
+            file_name="Extracted_Perfume_Invoices.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.error("Could not extract any matching invoice records from the uploaded PDF(s).")
