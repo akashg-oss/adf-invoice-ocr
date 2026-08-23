@@ -7,3 +7,4 @@ pytesseract
 Pillow
 rapidfuzz
 pypdf
+pdfminer.six
