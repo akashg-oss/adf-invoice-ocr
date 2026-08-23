@@ -1,7 +1,8 @@
 import difflib
+import io
 import re
 import pandas as pd
-import pypdf
+from pdfminer.high_level import extract_text
 import streamlit as st
 
 st.set_page_config(
@@ -11,14 +12,14 @@ st.title("📄 ADF Invoice OCR & SKU Matcher")
 
 
 def parse_and_match_invoices(pdf_file, df_master):
-    reader = pypdf.PdfReader(pdf_file)
-    full_text = "\n".join([page.extract_text() or "" for page in reader.pages])
+    # Use pdfminer to read corrupted/invalid PDF streams without throwing PdfReadError
+    pdf_bytes = io.BytesIO(pdf_file.read())
+    full_text = extract_text(pdf_bytes) or ""
 
-    # 1. Extract Invoice Number
+    # 1. Extract Header Details
     inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", full_text, re.IGNORECASE)
     inv_num = inv_match.group(0) if inv_match else "UNKNOWN"
 
-    # 2. Extract PO Number (Case-insensitive multi-line extraction)
     po_match = re.search(
         r"Buyer(?:'|’|s|\s)*Order\s*No\.?\s*\n?\s*([A-Z0-9/-]+)",
         full_text,
@@ -26,7 +27,6 @@ def parse_and_match_invoices(pdf_file, df_master):
     )
     po_number = po_match.group(1).strip() if po_match else "UNKNOWN"
 
-    # 3. Extract Destination (Handles ALL CAPS, Title Case, spaces, and punctuation)
     dest_match = re.search(
         r"Destination\s*\n?\s*([A-Za-z0-9\s.\-]+?)(?=\n[A-Z][a-z]|\n\n|\nMotor|\nTerms|\Z)",
         full_text,
@@ -34,7 +34,7 @@ def parse_and_match_invoices(pdf_file, df_master):
     )
     destination = dest_match.group(1).strip() if dest_match else "UNKNOWN"
 
-    # SKU Matching Helpers
+    # Helper Functions
     def clean_tokens(text):
         s = re.sub(r"[^A-Z0-9]", " ", str(text).upper())
         stop_words = {
@@ -116,22 +116,24 @@ def parse_and_match_invoices(pdf_file, df_master):
             )
         return "", "", raw_item_desc, 0.0
 
-    # Line Item Parser
+    # 2. Extract Line Items
     items = []
-    p1_lines = reader.pages[0].extract_text().split("\n")
+    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
 
     i = 0
-    while i < len(p1_lines):
-        line = p1_lines[i].strip()
+    while i < len(lines):
+        line = lines[i]
         sl_match = re.match(r"^(\d+)\s+(FG-PURPLLE-[A-Z0-9-]+)", line)
         if sl_match:
             sl_no = sl_match.group(1)
             desc_parts = [sl_match.group(2)]
 
             i += 1
-            while i < len(p1_lines) and "PCS" not in p1_lines[i]:
-                if p1_lines[i].strip():
-                    desc_parts.append(p1_lines[i].strip())
+            while i < len(lines) and not re.search(
+                r"\d{8}", lines[i]
+            ):  # HSN 33030050
+                if lines[i]:
+                    desc_parts.append(lines[i])
                 i += 1
 
             raw_desc = " ".join(desc_parts)
@@ -139,22 +141,19 @@ def parse_and_match_invoices(pdf_file, df_master):
                 r"\s+X\s+\d+$", "", raw_desc, flags=re.IGNORECASE
             ).strip()
 
-            num_line = p1_lines[i] if i < len(p1_lines) else ""
+            # Find item metrics across nearby lines
+            qty_pcs, rate, amount = 0.0, 0.0, 0.0
+            search_window = " ".join(lines[i : i + 10])
 
-            try:
-                parts = num_line.split("PCS")
-                amount = float(parts[0].replace(",", "").strip())
+            amt_match = re.search(r"([\d,]+\.\d{2})", search_window)
+            pcs_match = re.search(
+                r"([\d,]+(?:\.\d+)?)\s*PCS", search_window, re.IGNORECASE
+            )
 
-                m_rate_qty = re.match(
-                    r"^([\d,]+\.\d{2})([\d,]+(?:\.\d+)?)", parts[1].strip()
-                )
-                if m_rate_qty:
-                    rate = float(m_rate_qty.group(1).replace(",", ""))
-                    qty_pcs = float(m_rate_qty.group(2).replace(",", ""))
-                else:
-                    rate, qty_pcs = 0.0, 0.0
-            except Exception:
-                amount, rate, qty_pcs = 0.0, 0.0, 0.0
+            if amt_match:
+                amount = float(amt_match.group(1).replace(",", ""))
+            if pcs_match:
+                qty_pcs = float(pcs_match.group(1).replace(",", ""))
 
             sku_code, ean, sku_name, score = match_sku(clean_desc)
 
@@ -168,7 +167,6 @@ def parse_and_match_invoices(pdf_file, df_master):
                 "PO Number": po_number,
                 "Destination": destination,
                 "Quantity Dispatched (PCS)": int(qty_pcs),
-                "Price of FG (₹/PCS)": rate,
                 "Amount (₹)": amount,
                 "Match Score": score,
             })
