@@ -12,7 +12,7 @@ st.sidebar.header("Master SKU Mapping")
 master_sku_file = st.sidebar.file_uploader(
     "Upload Master SKU File",
     type=["xlsx", "xls", "csv"],
-    help="Upload master SKU list (first column will auto-map to Description of Goods).",
+    help="Upload your master list to auto-map EAN, SKU Code, SKU Name, etc.",
 )
 
 master_sku_df = None
@@ -22,6 +22,11 @@ if master_sku_file:
             master_sku_df = pd.read_csv(master_sku_file)
         else:
             master_sku_df = pd.read_excel(master_sku_file)
+
+        # Ensure all columns are converted to clean strings for merging
+        for col in master_sku_df.columns:
+            master_sku_df[col] = master_sku_df[col].astype(str).str.strip()
+
         st.sidebar.success(
             f"Loaded {len(master_sku_df)} Master SKU records!"
         )
@@ -39,18 +44,39 @@ uploaded_files = st.file_uploader(
 )
 
 
+def clean_description(text):
+    """Strip out numbers, amounts, PCS, box counts, and serial numbers leaving pure SKU description."""
+    # Remove item numbers at start (e.g., '1 ', '2 ')
+    text = re.sub(r"^\d+\s+", "", text)
+    # Remove amounts, rates, quantities (e.g., '1,40,833.44', 'PCS', '177.82')
+    text = re.sub(
+        r"[\d,]+\.\d{2,4}\s*(?:PCS)?|\bPCS\b|[\d,]+\.\d+|\bBOX\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Remove extra whitespace
+    return " ".join(text.split())
+
+
 def process_pdf(uploaded_file):
     """Extract structured data from uploaded PDF invoice."""
     file_bytes = uploaded_file.read()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    # Extract Header Fields from Page 1
+    # 1. Robust Invoice Number Extraction from Page 1
     page1_text = doc[0].get_text("text")
 
-    inv_match = re.search(r"Invoice No\.\s*([A-Z0-9/-]+)", page1_text)
-    invoice_no = inv_match.group(1).strip() if inv_match else None
+    inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", page1_text)
+    if not inv_match:
+        inv_match = re.search(
+            r"Invoice\s*No\.?\s*[:\n\s]*([A-Z0-9/\-]+)",
+            page1_text,
+            re.IGNORECASE,
+        )
+    invoice_no = inv_match.group(0).strip() if inv_match else ""
 
-    # Capture 10-digit PO number starting with 4 or standard PO pattern
+    # 2. Extract 10-digit PO number
     po_match = re.search(
         r"Buyer[’'s\s]*Order\s*No\.?[^\n]*\n\s*(\d{8,12})",
         page1_text,
@@ -58,29 +84,36 @@ def process_pdf(uploaded_file):
     )
     if not po_match:
         po_match = re.search(r"\b(4\d{9})\b", page1_text)
-    po_number = po_match.group(1).strip() if po_match else None
+    po_number = po_match.group(1).strip() if po_match else ""
 
-    dest_match = re.search(r"Destination\s*([A-Za-z]+)", page1_text)
+    # 3. Extract Destination
+    dest_match = re.search(r"Destination\s*[:\n\s]*([A-Za-z]+)", page1_text)
     destination = dest_match.group(1).strip() if dest_match else "Bangalore"
 
-    # Extract Line Items across all pages
+    # 4. Extract Line Items across all pages
     file_items = []
     for page in doc:
         text = page.get_text("text")
 
-        # Skip standalone e-Way bill page
+        # Skip standalone e-Way bill pages
         if "1. e-Way Bill Details" in text or "FORM GST EWB-01" in text:
             continue
 
         lines = text.split("\n")
         for i, line in enumerate(lines):
-            if line.startswith("FG-PURPLLE-") or "FG-PURPLLE" in line:
+            if "FG-PURPLLE" in line:
                 desc = line.strip()
                 j = i + 1
                 while j < len(lines) and not re.match(r"^\d{8}|\d+%", lines[j]):
-                    if lines[j].strip() and not lines[j].startswith("3303"):
+                    if (
+                        lines[j].strip()
+                        and not lines[j].startswith("3303")
+                        and not "ROUNDING OFF" in lines[j]
+                    ):
                         desc += " " + lines[j].strip()
                     j += 1
+
+                cleaned_desc = clean_description(desc)
 
                 file_items.append(
                     {
@@ -88,7 +121,7 @@ def process_pdf(uploaded_file):
                         "Invoice Number": invoice_no,
                         "PO Number": po_number,
                         "Destination": destination,
-                        "Description of Goods": desc,
+                        "Description of Goods": cleaned_desc,
                     }
                 )
 
@@ -120,32 +153,25 @@ if uploaded_files:
     if combined_data:
         df_result = pd.DataFrame(combined_data)
 
-        # Automatic merge without dropdowns
+        # Automatic merge with Master SKU file
         if master_sku_df is not None and not master_sku_df.empty:
-            # Match target column automatically
-            inv_col = (
-                "Description of Goods"
-                if "Description of Goods" in df_result.columns
-                else df_result.columns[0]
-            )
-            sku_col = master_sku_df.columns[0]
+            inv_col = "Description of Goods"
+            sku_col = master_sku_df.columns[0]  # Match against first column
 
-            # Standardize data types as strings to avoid merge errors
-            df_result[inv_col] = (
-                df_result[inv_col].astype(str).str.strip()
+            # Normalize values for exact matching
+            df_result["join_key"] = (
+                df_result[inv_col].astype(str).str.upper().str.strip()
             )
             master_sku_temp = master_sku_df.copy()
-            master_sku_temp[sku_col] = (
-                master_sku_temp[sku_col].astype(str).str.strip()
+            master_sku_temp["join_key"] = (
+                master_sku_temp[sku_col].astype(str).str.upper().str.strip()
             )
 
-            # Auto-join master SKU data
+            # Left Join master SKU columns onto extracted result
             df_result = df_result.merge(
-                master_sku_temp,
-                left_on=inv_col,
-                right_on=sku_col,
-                how="left",
+                master_sku_temp, on="join_key", how="left"
             )
+            df_result.drop(columns=["join_key"], inplace=True)
 
         st.success(f"Processed {len(uploaded_files)} file(s) successfully!")
         st.dataframe(df_result, use_container_width=True)
