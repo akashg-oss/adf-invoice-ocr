@@ -24,7 +24,6 @@ if master_sku_file:
         else:
             master_sku_df = pd.read_excel(master_sku_file)
 
-        # Standardize column names to string
         master_sku_df.columns = [
             str(c).strip() for c in master_sku_df.columns
         ]
@@ -51,16 +50,13 @@ def clean_text_for_matching(text):
     return text.strip()
 
 
-def extract_sku_name(raw_line):
-    """Clean multi-line raw item text down to pure SKU Description."""
-    if not raw_line:
-        return ""
-
-    # Remove item numbers at start (e.g., '1 ', '2 ') or HSN codes ('33030050 ')
-    cleaned = re.sub(r"^\d+\s+", "", raw_line)
+def extract_full_sku_from_block(block_text):
+    """Clean and extract full product description without table noise."""
+    # Strip item numbers/HSN numbers at start
+    cleaned = re.sub(r"^\d+\s+", "", block_text)
     cleaned = re.sub(r"^\d{8}\s+", "", cleaned)
 
-    # Clean out prices, quantities, PCS, rates, percentages
+    # Remove price, rate, quantity noise
     cleaned = re.sub(
         r"[\d,]+\.\d{2,4}\s*(?:PCS)?|\bPCS\b|[\d,]+\.\d+|\bBOX\b",
         "",
@@ -68,11 +64,9 @@ def extract_sku_name(raw_line):
         flags=re.IGNORECASE,
     )
 
-    # Capture complete product name starting at FG-PURPLLE through product details (e.g., X 36/X 48)
+    # Capture complete SKU name up to pack indicator (e.g. X 36 / X 48)
     match = re.search(
-        r"(FG-PURPLLE-[\w\d\-\s&\.\/]+?(?:\s*X\s*\d+)?)",
-        cleaned,
-        re.IGNORECASE,
+        r"(FG-PURPLLE[^\n]+?(?:\s*X\s*\d+)?)", cleaned, re.IGNORECASE
     )
     if match:
         return " ".join(match.group(1).split())
@@ -81,7 +75,7 @@ def extract_sku_name(raw_line):
 
 
 def process_pdf(uploaded_file):
-    """Extract Invoice No, PO, Destination, and multi-line SKU Descriptions."""
+    """Extract Header fields and assemble full multi-line SKU text using word coordinates."""
     file_bytes = uploaded_file.read()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
@@ -111,67 +105,90 @@ def process_pdf(uploaded_file):
     dest_match = re.search(r"Destination\s*[:\n\s]*([A-Za-z]+)", page1_text)
     destination = dest_match.group(1).strip() if dest_match else ""
 
-    # 4. Extract Line Items across pages using line grouping
+    # 4. Extract Line Items across pages using Coordinate-Based Word Grouping
     file_items = []
+
     for page in doc:
         text = page.get_text("text")
 
-        # Skip standalone e-Way bill pages
+        # Skip e-Way bill pages
         if "1. e-Way Bill Details" in text or "FORM GST EWB-01" in text:
             continue
 
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if "FG-PURPLLE" in line:
-                full_sku_block = line
-                j = i + 1
+        # Extract words: (x0, y0, x1, y1, word, block_no, line_no, word_no)
+        words = page.get_text("words")
+        if not words:
+            continue
 
-                # Continue consuming wrapped text lines until hitting next item/totals/HSN code
-                while j < len(lines):
-                    next_l = lines[j]
+        # Group words by vertical line position (y0 rounded within 3 points)
+        lines_dict = {}
+        for w in words:
+            y_key = round(w[1] / 3) * 3
+            lines_dict.setdefault(y_key, []).append(w)
+
+        sorted_y_keys = sorted(lines_dict.keys())
+
+        # Combine grouped words into clean horizontal lines
+        page_lines = []
+        for y_key in sorted_y_keys:
+            line_words = sorted(lines_dict[y_key], key=lambda x: x[0])
+            line_str = " ".join([w[4] for w in line_words])
+            page_lines.append(line_str)
+
+        # Iterate over line-grouped text
+        idx = 0
+        while idx < len(page_lines):
+            line = page_lines[idx]
+
+            if "FG-PURPLLE" in line:
+                full_sku_line = line
+                next_idx = idx + 1
+
+                # Continue stitching lines until hitting totals or next item
+                while next_idx < len(page_lines):
+                    next_l = page_lines[next_idx]
                     if (
                         re.match(r"^\d+\s+FG-PURPLLE", next_l)
                         or re.match(r"^\d{8}\b", next_l)
-                        or next_l
-                        in ["I.G.S.T.", "Total", "Amount Chargeable", "OUTPUT"]
-                        or "ROUNDING OFF" in next_l
+                        or any(
+                            k in next_l
+                            for k in [
+                                "I.G.S.T.",
+                                "Total",
+                                "Amount Chargeable",
+                                "OUTPUT",
+                                "ROUNDING OFF",
+                            ]
+                        )
                     ):
                         break
 
-                    # Append wrapped line parts smartly
-                    full_sku_block += (
-                        ""
-                        if full_sku_block.endswith("-")
-                        or next_l.startswith("-")
-                        else " "
-                    ) + next_l
-                    j += 1
+                    full_sku_line += " " + next_l
+                    next_idx += 1
 
-                    # Break when hitting pack count end marker like 'X 36' or 'X 48'
-                    if re.search(r"X\s*\d+$", next_l, re.IGNORECASE):
+                    # Stop stitching when hitting end pack marker (e.g. X 36, X 48)
+                    if re.search(r"\bX\s*\d+\b", next_l, re.IGNORECASE):
                         break
 
-                sku_name = extract_sku_name(full_sku_block)
+                cleaned_sku = extract_full_sku_from_block(full_sku_line)
 
-                # Avoid duplicate table summary blocks
-                if sku_name and not sku_name.startswith("3303"):
+                # Ignore HSN/summary rows
+                if cleaned_sku and not cleaned_sku.startswith("3303"):
                     file_items.append(
                         {
                             "File Name": uploaded_file.name,
                             "Invoice Number": invoice_no,
                             "PO Number": po_number,
                             "Destination": destination,
-                            "Description of Goods": sku_name,
+                            "Description of Goods": cleaned_sku,
                         }
                     )
-                i = j
+                idx = next_idx
             else:
-                i += 1
+                idx += 1
 
-    for idx, item in enumerate(file_items, start=1):
-        item["SI No"] = idx
+    for item_idx, item in enumerate(file_items, start=1):
+        item["SI No"] = item_idx
 
     return file_items
 
@@ -199,17 +216,17 @@ def xlookup_sku_data(sku_query, master_df):
         for val in master_df[master_sku_col].values
     ]
 
-    # 1. Direct Exact Normalized Match
+    # 1. Exact Match
     if query_clean in master_keys:
-        idx = master_keys.index(query_clean)
-        return master_df.iloc[idx].to_dict()
+        match_idx = master_keys.index(query_clean)
+        return master_df.iloc[match_idx].to_dict()
 
-    # 2. Fuzzy Match (XLOOKUP fallback)
-    matches = get_close_matches(query_clean, master_keys, n=1, cutoff=0.5)
+    # 2. Fuzzy Match Fallback
+    matches = get_close_matches(query_clean, master_keys, n=1, cutoff=0.45)
     if matches:
         best_match = matches[0]
-        idx = master_keys.index(best_match)
-        return master_df.iloc[idx].to_dict()
+        match_idx = master_keys.index(best_match)
+        return master_df.iloc[match_idx].to_dict()
 
     return {}
 
@@ -225,7 +242,7 @@ if uploaded_files:
     if combined_data:
         df_result = pd.DataFrame(combined_data)
 
-        # XLOOKUP extraction for EAN, SKU Code, SKU Name
+        # Perform XLOOKUP matching against Master SKU file
         if master_sku_df is not None:
             extracted_records = []
             for _, row in df_result.iterrows():
