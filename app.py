@@ -50,13 +50,16 @@ def clean_text_for_matching(text):
     return text.strip()
 
 
-def extract_full_sku_from_block(block_text):
-    """Clean and extract full product description without table noise."""
-    # Strip item numbers/HSN numbers at start
-    cleaned = re.sub(r"^\d+\s+", "", block_text)
+def extract_sku_name(raw_text):
+    """Clean multi-line raw item text into a clean SKU description."""
+    if not raw_text:
+        return ""
+
+    # Remove item numbers at start (e.g., '1 ', '2 ') or HSN codes ('33030050 ')
+    cleaned = re.sub(r"^\d+\s+", "", raw_text)
     cleaned = re.sub(r"^\d{8}\s+", "", cleaned)
 
-    # Remove price, rate, quantity noise
+    # Clean out prices, quantities, PCS, rates, percentages
     cleaned = re.sub(
         r"[\d,]+\.\d{2,4}\s*(?:PCS)?|\bPCS\b|[\d,]+\.\d+|\bBOX\b",
         "",
@@ -64,9 +67,14 @@ def extract_full_sku_from_block(block_text):
         flags=re.IGNORECASE,
     )
 
-    # Capture complete SKU name up to pack indicator (e.g. X 36 / X 48)
+    # Flatten wrapped hyphens (e.g. 'AURA -SPARKLING' -> 'AURA-SPARKLING')
+    cleaned = re.sub(r"(\b[A-Z0-9]+)\s*-\s*([A-Z0-9]+\b)", r"\1-\2", cleaned)
+
+    # Capture complete product name starting at FG-PURPLLE
     match = re.search(
-        r"(FG-PURPLLE[^\n]+?(?:\s*X\s*\d+)?)", cleaned, re.IGNORECASE
+        r"(FG-PURPLLE-[A-Z0-9\-\s&\.\/]+?(?:\s*X\s*\d+)?)",
+        cleaned,
+        re.IGNORECASE,
     )
     if match:
         return " ".join(match.group(1).split())
@@ -75,7 +83,7 @@ def extract_full_sku_from_block(block_text):
 
 
 def process_pdf(uploaded_file):
-    """Extract Header fields and assemble full multi-line SKU text using word coordinates."""
+    """Extract Header fields and line item descriptions across PDF pages."""
     file_bytes = uploaded_file.read()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
@@ -105,74 +113,68 @@ def process_pdf(uploaded_file):
     dest_match = re.search(r"Destination\s*[:\n\s]*([A-Za-z]+)", page1_text)
     destination = dest_match.group(1).strip() if dest_match else ""
 
-    # 4. Extract Line Items across pages using Coordinate-Based Word Grouping
+    # 4. Extract Line Items across pages using text blocks
     file_items = []
 
     for page in doc:
         text = page.get_text("text")
 
-        # Skip e-Way bill pages
+        # Skip e-Way bill summary pages
         if "1. e-Way Bill Details" in text or "FORM GST EWB-01" in text:
             continue
 
-        # Extract words: (x0, y0, x1, y1, word, block_no, line_no, word_no)
-        words = page.get_text("words")
-        if not words:
-            continue
+        # Use blocks to preserve line wrapping context within table cells
+        blocks = page.get_text("blocks")
+        full_page_str = ""
+        for b in blocks:
+            full_page_str += b[4] + "\n"
 
-        # Group words by vertical line position (y0 rounded within 3 points)
-        lines_dict = {}
-        for w in words:
-            y_key = round(w[1] / 3) * 3
-            lines_dict.setdefault(y_key, []).append(w)
+        lines = [l.strip() for l in full_page_str.split("\n") if l.strip()]
 
-        sorted_y_keys = sorted(lines_dict.keys())
-
-        # Combine grouped words into clean horizontal lines
-        page_lines = []
-        for y_key in sorted_y_keys:
-            line_words = sorted(lines_dict[y_key], key=lambda x: x[0])
-            line_str = " ".join([w[4] for w in line_words])
-            page_lines.append(line_str)
-
-        # Iterate over line-grouped text
-        idx = 0
-        while idx < len(page_lines):
-            line = page_lines[idx]
+        i = 0
+        while i < len(lines):
+            line = lines[i]
 
             if "FG-PURPLLE" in line:
-                full_sku_line = line
-                next_idx = idx + 1
+                accumulated_block = line
+                j = i + 1
 
-                # Continue stitching lines until hitting totals or next item
-                while next_idx < len(page_lines):
-                    next_l = page_lines[next_idx]
+                # Read ahead and append next wrapped lines if present
+                while j < len(lines):
+                    next_l = lines[j]
+
+                    # Stop if we hit HSN Code (33030050), Next Serial Item, or Totals block
                     if (
-                        re.match(r"^\d+\s+FG-PURPLLE", next_l)
-                        or re.match(r"^\d{8}\b", next_l)
+                        re.match(r"^\d{8}\b", next_l)
+                        or re.match(r"^\d+\s+FG-PURPLLE", next_l)
                         or any(
-                            k in next_l
-                            for k in [
+                            stop_kw in next_l
+                            for stop_kw in [
                                 "I.G.S.T.",
                                 "Total",
                                 "Amount Chargeable",
-                                "OUTPUT",
                                 "ROUNDING OFF",
                             ]
                         )
                     ):
                         break
 
-                    full_sku_line += " " + next_l
-                    next_idx += 1
+                    # Append wrapped line text
+                    if accumulated_block.endswith("-") or next_l.startswith(
+                        "-"
+                    ):
+                        accumulated_block += next_l
+                    else:
+                        accumulated_block += " " + next_l
 
-                    # Stop stitching when hitting end pack marker (e.g. X 36, X 48)
-                    if re.search(r"\bX\s*\d+\b", next_l, re.IGNORECASE):
+                    j += 1
+
+                    # Stop when pack count indicator is found (e.g. 'X 36')
+                    if re.search(r"X\s*\d+$", next_l, re.IGNORECASE):
                         break
 
-                cleaned_sku = extract_full_sku_from_block(full_sku_line)
+                cleaned_sku = extract_sku_name(accumulated_block)
 
-                # Ignore HSN/summary rows
                 if cleaned_sku and not cleaned_sku.startswith("3303"):
                     file_items.append(
                         {
@@ -183,14 +185,23 @@ def process_pdf(uploaded_file):
                             "Description of Goods": cleaned_sku,
                         }
                     )
-                idx = next_idx
+                i = j
             else:
-                idx += 1
+                i += 1
 
-    for item_idx, item in enumerate(file_items, start=1):
-        item["SI No"] = item_idx
+    # Remove duplicates if same item was captured twice from tax summary tables
+    unique_items = []
+    seen = set()
+    for item in file_items:
+        key = (item["Invoice Number"], item["Description of Goods"])
+        if key not in seen:
+            seen.add(key)
+            unique_items.append(item)
 
-    return file_items
+    for idx, item in enumerate(unique_items, start=1):
+        item["SI No"] = idx
+
+    return unique_items
 
 
 def xlookup_sku_data(sku_query, master_df):
@@ -216,17 +227,17 @@ def xlookup_sku_data(sku_query, master_df):
         for val in master_df[master_sku_col].values
     ]
 
-    # 1. Exact Match
+    # 1. Direct Exact Normalized Match
     if query_clean in master_keys:
-        match_idx = master_keys.index(query_clean)
-        return master_df.iloc[match_idx].to_dict()
+        idx = master_keys.index(query_clean)
+        return master_df.iloc[idx].to_dict()
 
-    # 2. Fuzzy Match Fallback
+    # 2. Fuzzy Match (XLOOKUP fallback)
     matches = get_close_matches(query_clean, master_keys, n=1, cutoff=0.45)
     if matches:
         best_match = matches[0]
-        match_idx = master_keys.index(best_match)
-        return master_df.iloc[match_idx].to_dict()
+        idx = master_keys.index(best_match)
+        return master_df.iloc[idx].to_dict()
 
     return {}
 
@@ -242,7 +253,7 @@ if uploaded_files:
     if combined_data:
         df_result = pd.DataFrame(combined_data)
 
-        # Perform XLOOKUP matching against Master SKU file
+        # XLOOKUP extraction for EAN, SKU Code, SKU Name from Master SKU File
         if master_sku_df is not None:
             extracted_records = []
             for _, row in df_result.iterrows():
