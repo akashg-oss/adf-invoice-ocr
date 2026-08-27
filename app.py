@@ -4,7 +4,7 @@ import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Invoice Extractor & Master SKU Mapper", layout="wide")
+st.set_page_config(page_title="Invoice Extractor & SKU Mapper", layout="wide")
 st.title("Invoice Extractor & Master SKU Mapper")
 
 # --- SIDEBAR: MASTER SKU FILE UPLOAD ---
@@ -38,8 +38,10 @@ uploaded_files = st.file_uploader(
 
 
 def extract_search_key(text):
-    """Extracts text starting from volume (e.g., 100ML, 50ML, 20ML) up to product keywords.
-    Example: '1 FG-PURPLLE-PER-100ML-AURA-LOVE STRUCK DELIGHT X 36' -> '100ML AURA LOVE STRUCK DELIGHT'
+    """Extracts starting from volume (e.g. 100ML, 50ML, 20ML) up to product keywords.
+
+    Example: '1 FG-PURPLLE-PER-100ML-AURA-LOVE STRUCK DELIGHT X 36' -> '100ML AURA
+    LOVE STRUCK DELIGHT'
     """
     if not isinstance(text, str):
         return ""
@@ -50,19 +52,19 @@ def extract_search_key(text):
 
     extracted = match.group(1)
 
-    # Trim trailing pack sizes like 'X 36', 'X36', or '-X-36'
+    # Strip trailing pack indicator (e.g., 'X 36', 'X36')
     extracted = re.sub(
         r"[\s\-_]+X[\s\-_]*\d+.*$", "", extracted, flags=re.IGNORECASE
     )
 
-    # Clean punctuation and normalize spacing
+    # Clean punctuation and extra spaces
     clean_key = re.sub(r"[\-_]+", " ", extracted).strip().upper()
     return " ".join(clean_key.split())
 
 
-def extract_line_items_from_fitz(doc):
-    """Extract line items robustly across pages using PyMuPDF block parsing."""
-    items = []
+def extract_table_items(doc):
+    """Uses PyMuPDF find_tables() to accurately extract description column rows."""
+    descriptions = []
 
     for page in doc:
         page_text = page.get_text("text")
@@ -71,65 +73,47 @@ def extract_line_items_from_fitz(doc):
         if "1. e-Way Bill Details" in page_text or "CEWB No." in page_text:
             continue
 
-        # Extract blocks: b[4] contains full text content of a block box
-        blocks = page.get_text("blocks")
-        lines = []
-        for b in blocks:
-            for l in b[4].split("\n"):
-                if l.strip():
-                    lines.append(l.strip())
+        tabs = page.find_tables()
+        if not tabs.tables:
+            continue
 
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if "FG-PURPLLE" in line:
-                combined_desc = line
-                j = i + 1
-                while j < len(lines):
-                    next_l = lines[j]
+        for table in tabs.tables:
+            table_data = table.extract()
+            if not table_data:
+                continue
 
-                    # Stop if encountering HSN code, next serial number, or invoice totals
-                    if (
-                        re.match(r"^\d{8}\b", next_l)
-                        or re.match(r"^\d+\s+FG-PURPLLE", next_l)
-                        or any(
-                            k in next_l
-                            for k in [
-                                "I.G.S.T.",
-                                "Total",
-                                "Amount Chargeable",
-                                "ROUNDING OFF",
-                            ]
-                        )
-                    ):
+            # Find 'Description of Goods' column index dynamically
+            desc_col_idx = None
+            for row in table_data[:3]:
+                for idx, cell in enumerate(row):
+                    if cell and "Description of Goods" in cell:
+                        desc_col_idx = idx
                         break
+                if desc_col_idx is not None:
+                    break
 
-                    # Join multi-line split text
-                    if combined_desc.endswith("-") or next_l.startswith("-"):
-                        combined_desc += next_l
-                    else:
-                        combined_desc += " " + next_l
+            # Fallback column index if header not matched
+            if desc_col_idx is None:
+                desc_col_idx = 1
 
-                    j += 1
-                    if "X " in next_l or re.search(r"X\s*\d+$", next_l):
-                        break
+            # Extract cell content from rows
+            for row in table_data:
+                if len(row) > desc_col_idx and row[desc_col_idx]:
+                    cell_text = row[desc_col_idx].replace("\n", " ").strip()
+                    if "FG-PURPLLE" in cell_text:
+                        descriptions.append(cell_text)
 
-                items.append(combined_desc)
-                i = j
-            else:
-                i += 1
-
-    return items
+    return descriptions
 
 
 def process_pdf_file(uploaded_file):
-    """Processes header attributes and line item extractions per PDF."""
+    """Processes metadata header and extracts item descriptions per PDF."""
     file_bytes = uploaded_file.read()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
     page1_text = doc[0].get_text("text")
 
-    # Header Extraction
+    # Header values extraction
     inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", page1_text)
     if not inv_match:
         inv_match = re.search(
@@ -149,7 +133,7 @@ def process_pdf_file(uploaded_file):
     dest_match = re.search(r"Destination\s*[:\n\s]*([A-Za-z]+)", page1_text)
     destination = dest_match.group(1).strip() if dest_match else ""
 
-    raw_descriptions = extract_line_items_from_fitz(doc)
+    raw_descriptions = extract_table_items(doc)
     doc.close()
 
     records = []
@@ -165,12 +149,12 @@ def process_pdf_file(uploaded_file):
             }
         )
 
-    # Deduplicate repeated tax summary rows
+    # Deduplicate repeated item records from tax summary tables
     seen = set()
     unique_records = []
     for r in records:
-        key = (r["Invoice Number"], r["Description of Goods"])
-        if key not in seen:
+        key = (r["Invoice Number"], r["Extracted Search Key"])
+        if key not in seen and r["Extracted Search Key"]:
             seen.add(key)
             unique_records.append(r)
 
@@ -195,7 +179,9 @@ if uploaded_files:
         if master_sku_df is not None:
             sku_col = None
             for c in master_sku_df.columns:
-                if any(k in c.lower() for k in ["sku name", "description", "item"]):
+                if any(
+                    k in c.lower() for k in ["sku name", "description", "item"]
+                ):
                     sku_col = c
                     break
             if not sku_col:
