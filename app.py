@@ -1,3 +1,4 @@
+from difflib import get_close_matches
 import io
 import re
 import fitz  # PyMuPDF
@@ -10,9 +11,9 @@ st.title("Invoice Extractor & Master SKU Mapper")
 # --- SIDEBAR: MASTER SKU FILE UPLOAD ---
 st.sidebar.header("Master SKU Mapping")
 master_sku_file = st.sidebar.file_uploader(
-    "Upload Master SKU File",
+    "Upload EAN_SKU File",
     type=["xlsx", "xls", "csv"],
-    help="Upload your master list to auto-map EAN, SKU Code, SKU Name, etc.",
+    help="Upload master file with columns like 'SKU Name', 'SKU Code', 'EAN'",
 )
 
 master_sku_df = None
@@ -23,10 +24,10 @@ if master_sku_file:
         else:
             master_sku_df = pd.read_excel(master_sku_file)
 
-        # Ensure all columns are converted to clean strings for merging
-        for col in master_sku_df.columns:
-            master_sku_df[col] = master_sku_df[col].astype(str).str.strip()
-
+        # Standardize column names to string
+        master_sku_df.columns = [
+            str(c).strip() for c in master_sku_df.columns
+        ]
         st.sidebar.success(
             f"Loaded {len(master_sku_df)} Master SKU records!"
         )
@@ -35,38 +36,49 @@ if master_sku_file:
     except Exception as e:
         st.sidebar.error(f"Error loading Master SKU file: {e}")
 
-# --- MAIN SECTION: INVOICE / EXCEL FILE UPLOAD ---
-st.header("Upload Invoices / Excel Files")
+# --- MAIN SECTION: INVOICE UPLOAD ---
+st.header("Upload Invoices")
 uploaded_files = st.file_uploader(
-    "Upload PDF Invoices or Data Spreadsheets",
-    type=["pdf", "xlsx", "xls"],
-    accept_multiple_files=True,
+    "Upload PDF Invoices", type=["pdf"], accept_multiple_files=True
 )
 
 
-def clean_description(text):
-    """Strip out numbers, amounts, PCS, box counts, and serial numbers leaving pure SKU description."""
-    # Remove item numbers at start (e.g., '1 ', '2 ')
-    text = re.sub(r"^\d+\s+", "", text)
-    # Remove amounts, rates, quantities (e.g., '1,40,833.44', 'PCS', '177.82')
-    text = re.sub(
+def clean_text_for_matching(text):
+    """Normalize string by upper-casing, removing hyphens, and stripping extra spaces."""
+    if not isinstance(text, str):
+        return ""
+    # Convert to uppercase and replace hyphens/symbols with space
+    text = re.sub(r"[-_:\s]+", " ", text.upper())
+    return text.strip()
+
+
+def extract_sku_name(raw_line):
+    """Extract clean SKU name without quantity/amount noise."""
+    # Capture string starting at FG-PURPLLE up to quantity markers (e.g. X 36 or prices)
+    match = re.search(r"(FG-PURPLLE[^\d\n]+(?:\s*X\s*\d+)?)", raw_line)
+    if match:
+        return match.group(1).strip()
+
+    # Fallback cleaning
+    cleaned = re.sub(r"^\d+\s+", "", raw_line)
+    cleaned = re.sub(
         r"[\d,]+\.\d{2,4}\s*(?:PCS)?|\bPCS\b|[\d,]+\.\d+|\bBOX\b",
         "",
-        text,
+        cleaned,
         flags=re.IGNORECASE,
     )
-    # Remove extra whitespace
-    return " ".join(text.split())
+    return " ".join(cleaned.split())
 
 
 def process_pdf(uploaded_file):
-    """Extract structured data from uploaded PDF invoice."""
+    """Extract Invoice No, PO, Destination, and SKU Name using PyMuPDF (OCR/Text parser)."""
     file_bytes = uploaded_file.read()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    # 1. Robust Invoice Number Extraction from Page 1
+    # 1. OCR / Text Extraction for Header Fields from Page 1
     page1_text = doc[0].get_text("text")
 
+    # Invoice Number
     inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", page1_text)
     if not inv_match:
         inv_match = re.search(
@@ -76,44 +88,44 @@ def process_pdf(uploaded_file):
         )
     invoice_no = inv_match.group(0).strip() if inv_match else ""
 
-    # 2. Extract 10-digit PO number
-    po_match = re.search(
-        r"Buyer[’'s\s]*Order\s*No\.?[^\n]*\n\s*(\d{8,12})",
-        page1_text,
-        re.IGNORECASE,
-    )
+    # PO Number
+    po_match = re.search(r"\b(4\d{9})\b", page1_text)
     if not po_match:
-        po_match = re.search(r"\b(4\d{9})\b", page1_text)
+        po_match = re.search(
+            r"Buyer[’'s\s]*Order\s*No\.?[^\n]*\n\s*(\d{8,12})",
+            page1_text,
+            re.IGNORECASE,
+        )
     po_number = po_match.group(1).strip() if po_match else ""
 
-    # 3. Extract Destination
+    # Destination
     dest_match = re.search(r"Destination\s*[:\n\s]*([A-Za-z]+)", page1_text)
-    destination = dest_match.group(1).strip() if dest_match else "Bangalore"
+    destination = dest_match.group(1).strip() if dest_match else ""
 
-    # 4. Extract Line Items across all pages
+    # 2. Extract SKU Name per line item across pages
     file_items = []
     for page in doc:
         text = page.get_text("text")
 
-        # Skip standalone e-Way bill pages
+        # Skip e-Way bill pages
         if "1. e-Way Bill Details" in text or "FORM GST EWB-01" in text:
             continue
 
         lines = text.split("\n")
         for i, line in enumerate(lines):
             if "FG-PURPLLE" in line:
-                desc = line.strip()
+                raw_sku = line.strip()
                 j = i + 1
                 while j < len(lines) and not re.match(r"^\d{8}|\d+%", lines[j]):
                     if (
                         lines[j].strip()
                         and not lines[j].startswith("3303")
-                        and not "ROUNDING OFF" in lines[j]
+                        and "ROUNDING OFF" not in lines[j]
                     ):
-                        desc += " " + lines[j].strip()
+                        raw_sku += " " + lines[j].strip()
                     j += 1
 
-                cleaned_desc = clean_description(desc)
+                sku_name = extract_sku_name(raw_sku)
 
                 file_items.append(
                     {
@@ -121,7 +133,7 @@ def process_pdf(uploaded_file):
                         "Invoice Number": invoice_no,
                         "PO Number": po_number,
                         "Destination": destination,
-                        "Description of Goods": cleaned_desc,
+                        "Description of Goods": sku_name,
                     }
                 )
 
@@ -131,52 +143,76 @@ def process_pdf(uploaded_file):
     return file_items
 
 
-def process_excel(uploaded_file):
-    """Read data directly from uploaded Excel file."""
-    df_excel = pd.read_excel(uploaded_file)
-    df_excel["File Name"] = uploaded_file.name
-    return df_excel.to_dict(orient="records")
+def xlookup_sku_data(sku_query, master_df):
+    """XLOOKUP logic: Attempts exact lookup, then normalized lookup, then fuzzy matching."""
+    if master_df is None or master_df.empty:
+        return {}
+
+    # Identify SKU Name/Description column in Master file
+    master_sku_col = None
+    for col in master_df.columns:
+        if any(
+            k in col.lower() for k in ["sku name", "description", "sku_name", "item"]
+        ):
+            master_sku_col = col
+            break
+    if not master_sku_col:
+        master_sku_col = master_df.columns[0]
+
+    # Pre-clean query
+    query_clean = clean_text_for_matching(sku_query)
+
+    # Build lookup dictionary with normalized keys
+    master_keys = [
+        clean_text_for_matching(str(val))
+        for val in master_df[master_sku_col].values
+    ]
+
+    # 1. Direct / Exact Normalized Match
+    if query_clean in master_keys:
+        idx = master_keys.index(query_clean)
+        return master_df.iloc[idx].to_dict()
+
+    # 2. Fuzzy Match (XLOOKUP fallback)
+    matches = get_close_matches(query_clean, master_keys, n=1, cutoff=0.6)
+    if matches:
+        best_match = matches[0]
+        idx = master_keys.index(best_match)
+        return master_df.iloc[idx].to_dict()
+
+    return {}
 
 
-# --- DATA PROCESSING & DISPLAY ---
+# --- MAIN EXECUTION ---
 if uploaded_files:
     combined_data = []
 
     for file in uploaded_files:
-        if file.name.endswith(".pdf"):
-            pdf_records = process_pdf(file)
-            combined_data.extend(pdf_records)
-        elif file.name.endswith((".xlsx", ".xls")):
-            excel_records = process_excel(file)
-            combined_data.extend(excel_records)
+        pdf_records = process_pdf(file)
+        combined_data.extend(pdf_records)
 
     if combined_data:
         df_result = pd.DataFrame(combined_data)
 
-        # Automatic merge with Master SKU file
-        if master_sku_df is not None and not master_sku_df.empty:
-            inv_col = "Description of Goods"
-            sku_col = master_sku_df.columns[0]  # Match against first column
+        # 2. XLOOKUP Extraction for EAN, SKU Code, SKU Name
+        if master_sku_df is not None:
+            extracted_records = []
+            for _, row in df_result.iterrows():
+                sku_query = row["Description of Goods"]
+                master_match = xlookup_sku_data(sku_query, master_sku_df)
 
-            # Normalize values for exact matching
-            df_result["join_key"] = (
-                df_result[inv_col].astype(str).str.upper().str.strip()
-            )
-            master_sku_temp = master_sku_df.copy()
-            master_sku_temp["join_key"] = (
-                master_sku_temp[sku_col].astype(str).str.upper().str.strip()
-            )
+                # Merge master file fields (EAN, SKU Code, SKU Name)
+                row_dict = row.to_dict()
+                for col in master_sku_df.columns:
+                    row_dict[col] = master_match.get(col, None)
+                extracted_records.append(row_dict)
 
-            # Left Join master SKU columns onto extracted result
-            df_result = df_result.merge(
-                master_sku_temp, on="join_key", how="left"
-            )
-            df_result.drop(columns=["join_key"], inplace=True)
+            df_result = pd.DataFrame(extracted_records)
 
         st.success(f"Processed {len(uploaded_files)} file(s) successfully!")
         st.dataframe(df_result, use_container_width=True)
 
-        # Download Result as Excel
+        # Excel Export
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df_result.to_excel(writer, index=False, sheet_name="Extracted_Data")
