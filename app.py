@@ -47,38 +47,47 @@ def clean_text_for_matching(text):
     """Normalize string by upper-casing, removing hyphens, and stripping extra spaces."""
     if not isinstance(text, str):
         return ""
-    # Convert to uppercase and replace hyphens/symbols with space
     text = re.sub(r"[-_:\s]+", " ", text.upper())
     return text.strip()
 
 
 def extract_sku_name(raw_line):
-    """Extract clean SKU name without quantity/amount noise."""
-    # Capture string starting at FG-PURPLLE up to quantity markers (e.g. X 36 or prices)
-    match = re.search(r"(FG-PURPLLE[^\d\n]+(?:\s*X\s*\d+)?)", raw_line)
-    if match:
-        return match.group(1).strip()
+    """Clean multi-line raw item text down to pure SKU Description."""
+    if not raw_line:
+        return ""
 
-    # Fallback cleaning
+    # Remove item numbers at start (e.g., '1 ', '2 ') or HSN codes ('33030050 ')
     cleaned = re.sub(r"^\d+\s+", "", raw_line)
+    cleaned = re.sub(r"^\d{8}\s+", "", cleaned)
+
+    # Clean out prices, quantities, PCS, rates, percentages
     cleaned = re.sub(
         r"[\d,]+\.\d{2,4}\s*(?:PCS)?|\bPCS\b|[\d,]+\.\d+|\bBOX\b",
         "",
         cleaned,
         flags=re.IGNORECASE,
     )
+
+    # Capture complete product name starting at FG-PURPLLE through product details (e.g., X 36/X 48)
+    match = re.search(
+        r"(FG-PURPLLE-[\w\d\-\s&\.\/]+?(?:\s*X\s*\d+)?)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if match:
+        return " ".join(match.group(1).split())
+
     return " ".join(cleaned.split())
 
 
 def process_pdf(uploaded_file):
-    """Extract Invoice No, PO, Destination, and SKU Name using PyMuPDF (OCR/Text parser)."""
+    """Extract Invoice No, PO, Destination, and multi-line SKU Descriptions."""
     file_bytes = uploaded_file.read()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    # 1. OCR / Text Extraction for Header Fields from Page 1
     page1_text = doc[0].get_text("text")
 
-    # Invoice Number
+    # 1. Invoice Number
     inv_match = re.search(r"ADF/\d{4}-\d{2}/\d+", page1_text)
     if not inv_match:
         inv_match = re.search(
@@ -88,7 +97,7 @@ def process_pdf(uploaded_file):
         )
     invoice_no = inv_match.group(0).strip() if inv_match else ""
 
-    # PO Number
+    # 2. PO Number
     po_match = re.search(r"\b(4\d{9})\b", page1_text)
     if not po_match:
         po_match = re.search(
@@ -98,44 +107,68 @@ def process_pdf(uploaded_file):
         )
     po_number = po_match.group(1).strip() if po_match else ""
 
-    # Destination
+    # 3. Destination
     dest_match = re.search(r"Destination\s*[:\n\s]*([A-Za-z]+)", page1_text)
     destination = dest_match.group(1).strip() if dest_match else ""
 
-    # 2. Extract SKU Name per line item across pages
+    # 4. Extract Line Items across pages using line grouping
     file_items = []
     for page in doc:
         text = page.get_text("text")
 
-        # Skip e-Way bill pages
+        # Skip standalone e-Way bill pages
         if "1. e-Way Bill Details" in text or "FORM GST EWB-01" in text:
             continue
 
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        i = 0
+        while i < len(lines):
+            line = lines[i]
             if "FG-PURPLLE" in line:
-                raw_sku = line.strip()
+                full_sku_block = line
                 j = i + 1
-                while j < len(lines) and not re.match(r"^\d{8}|\d+%", lines[j]):
+
+                # Continue consuming wrapped text lines until hitting next item/totals/HSN code
+                while j < len(lines):
+                    next_l = lines[j]
                     if (
-                        lines[j].strip()
-                        and not lines[j].startswith("3303")
-                        and "ROUNDING OFF" not in lines[j]
+                        re.match(r"^\d+\s+FG-PURPLLE", next_l)
+                        or re.match(r"^\d{8}\b", next_l)
+                        or next_l
+                        in ["I.G.S.T.", "Total", "Amount Chargeable", "OUTPUT"]
+                        or "ROUNDING OFF" in next_l
                     ):
-                        raw_sku += " " + lines[j].strip()
+                        break
+
+                    # Append wrapped line parts smartly
+                    full_sku_block += (
+                        ""
+                        if full_sku_block.endswith("-")
+                        or next_l.startswith("-")
+                        else " "
+                    ) + next_l
                     j += 1
 
-                sku_name = extract_sku_name(raw_sku)
+                    # Break when hitting pack count end marker like 'X 36' or 'X 48'
+                    if re.search(r"X\s*\d+$", next_l, re.IGNORECASE):
+                        break
 
-                file_items.append(
-                    {
-                        "File Name": uploaded_file.name,
-                        "Invoice Number": invoice_no,
-                        "PO Number": po_number,
-                        "Destination": destination,
-                        "Description of Goods": sku_name,
-                    }
-                )
+                sku_name = extract_sku_name(full_sku_block)
+
+                # Avoid duplicate table summary blocks
+                if sku_name and not sku_name.startswith("3303"):
+                    file_items.append(
+                        {
+                            "File Name": uploaded_file.name,
+                            "Invoice Number": invoice_no,
+                            "PO Number": po_number,
+                            "Destination": destination,
+                            "Description of Goods": sku_name,
+                        }
+                    )
+                i = j
+            else:
+                i += 1
 
     for idx, item in enumerate(file_items, start=1):
         item["SI No"] = idx
@@ -159,22 +192,20 @@ def xlookup_sku_data(sku_query, master_df):
     if not master_sku_col:
         master_sku_col = master_df.columns[0]
 
-    # Pre-clean query
     query_clean = clean_text_for_matching(sku_query)
 
-    # Build lookup dictionary with normalized keys
     master_keys = [
         clean_text_for_matching(str(val))
         for val in master_df[master_sku_col].values
     ]
 
-    # 1. Direct / Exact Normalized Match
+    # 1. Direct Exact Normalized Match
     if query_clean in master_keys:
         idx = master_keys.index(query_clean)
         return master_df.iloc[idx].to_dict()
 
     # 2. Fuzzy Match (XLOOKUP fallback)
-    matches = get_close_matches(query_clean, master_keys, n=1, cutoff=0.6)
+    matches = get_close_matches(query_clean, master_keys, n=1, cutoff=0.5)
     if matches:
         best_match = matches[0]
         idx = master_keys.index(best_match)
@@ -194,14 +225,13 @@ if uploaded_files:
     if combined_data:
         df_result = pd.DataFrame(combined_data)
 
-        # 2. XLOOKUP Extraction for EAN, SKU Code, SKU Name
+        # XLOOKUP extraction for EAN, SKU Code, SKU Name
         if master_sku_df is not None:
             extracted_records = []
             for _, row in df_result.iterrows():
                 sku_query = row["Description of Goods"]
                 master_match = xlookup_sku_data(sku_query, master_sku_df)
 
-                # Merge master file fields (EAN, SKU Code, SKU Name)
                 row_dict = row.to_dict()
                 for col in master_sku_df.columns:
                     row_dict[col] = master_match.get(col, None)
