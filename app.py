@@ -12,7 +12,7 @@ st.sidebar.header("Master SKU Mapping")
 master_sku_file = st.sidebar.file_uploader(
     "Upload Master SKU File",
     type=["xlsx", "xls", "csv"],
-    help="Upload your master list to map descriptions or codes to Master SKUs.",
+    help="Upload master SKU list (first column will auto-map to Description of Goods).",
 )
 
 master_sku_df = None
@@ -26,7 +26,7 @@ if master_sku_file:
             f"Loaded {len(master_sku_df)} Master SKU records!"
         )
         with st.sidebar.expander("Preview Master SKU Data"):
-            st.dataframe(master_sku_df.head())
+            st.sidebar.dataframe(master_sku_df.head())
     except Exception as e:
         st.sidebar.error(f"Error loading Master SKU file: {e}")
 
@@ -50,7 +50,7 @@ def process_pdf(uploaded_file):
     inv_match = re.search(r"Invoice No\.\s*([A-Z0-9/-]+)", page1_text)
     invoice_no = inv_match.group(1).strip() if inv_match else None
 
-    # Capture 10-digit PO number starting with 4 or general buyer order digits
+    # Capture 10-digit PO number starting with 4 or standard PO pattern
     po_match = re.search(
         r"Buyer[’'s\s]*Order\s*No\.?[^\n]*\n\s*(\d{8,12})",
         page1_text,
@@ -58,24 +58,12 @@ def process_pdf(uploaded_file):
     )
     if not po_match:
         po_match = re.search(r"\b(4\d{9})\b", page1_text)
-    po_number = (
-        po_match.group(1).strip()
-        if po_match
-        else (
-            re.search(
-                r"Buyer'?s Order No\.\s*(\d+)", page1_text, re.IGNORECASE
-            ).group(1)
-            if re.search(
-                r"Buyer'?s Order No\.\s*(\d+)", page1_text, re.IGNORECASE
-            )
-            else None
-        )
-    )
+    po_number = po_match.group(1).strip() if po_match else None
 
     dest_match = re.search(r"Destination\s*([A-Za-z]+)", page1_text)
     destination = dest_match.group(1).strip() if dest_match else "Bangalore"
 
-    # Extract Line Items across all pages (excluding e-Way bill pages)
+    # Extract Line Items across all pages
     file_items = []
     for page in doc:
         text = page.get_text("text")
@@ -132,29 +120,28 @@ if uploaded_files:
     if combined_data:
         df_result = pd.DataFrame(combined_data)
 
-        # Merge with Master SKU mapping if uploaded
-        if master_sku_df is not None:
-            st.subheader("Map Master SKU")
-            col1, col2 = st.columns(2)
-            with col1:
-                inv_col = st.selectbox(
-                    "Select Invoice Column to Match",
-                    options=df_result.columns,
-                    index=(
-                        list(df_result.columns).index("Description of Goods")
-                        if "Description of Goods" in df_result.columns
-                        else 0
-                    ),
-                )
-            with col2:
-                sku_col = st.selectbox(
-                    "Select Master SKU File Column to Match On",
-                    options=master_sku_df.columns,
-                )
+        # Automatic merge without dropdowns
+        if master_sku_df is not None and not master_sku_df.empty:
+            # Match target column automatically
+            inv_col = (
+                "Description of Goods"
+                if "Description of Goods" in df_result.columns
+                else df_result.columns[0]
+            )
+            sku_col = master_sku_df.columns[0]
 
-            # Perform Left Join to keep all extracted rows
+            # Standardize data types as strings to avoid merge errors
+            df_result[inv_col] = (
+                df_result[inv_col].astype(str).str.strip()
+            )
+            master_sku_temp = master_sku_df.copy()
+            master_sku_temp[sku_col] = (
+                master_sku_temp[sku_col].astype(str).str.strip()
+            )
+
+            # Auto-join master SKU data
             df_result = df_result.merge(
-                master_sku_df,
+                master_sku_temp,
                 left_on=inv_col,
                 right_on=sku_col,
                 how="left",
