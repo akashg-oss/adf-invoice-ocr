@@ -475,17 +475,19 @@ def extract_invoice_items(text):
 
 def product_key(value):
     """
-    Creates a comparable product key.
+    Build a typo-tolerant product key.
 
-    Example:
-      Invoice:
-      FG-PURPLLE-PER-20ML-STAY-OUD TILL DOWN
+    ADF descriptions can contain:
+      - spelling errors (ECSTECY instead of ECSTASY)
+      - split words (LOVE STRUCK vs LOVESTRUCK)
+      - split words (DAY DREAMS vs DAYDREAMS)
+      - small OCR errors
 
-      Master:
-      Faces Canada STAY Oud Till Dawn Eau de Parfum mini - 20ml
-
-      Both become approximately:
-      OUD TILL DOWN 20ML
+    We therefore:
+      1. Keep the volume separately.
+      2. Remove brand/generic perfume wording.
+      3. Remove spaces/hyphens for comparison.
+      4. Compare the resulting product name using fuzzy matching.
     """
     s = norm(value)
 
@@ -495,53 +497,113 @@ def product_key(value):
     )
     volume = volume_match.group(1) if volume_match else ""
 
-    phrases = [
-        "OUD TILL DOWN",
-        "AMBER UNTIL SUNSET",
-        "BLOOM AFTER DARK",
-        "SUGAR AFTER DUSK",
-        "VANILLA PAST MIDNIGHT",
-        "WHITE MOON LIGHT",
-        "SPARKLING ECSTASY",
-        "AURA SOFT SERENITY",
-        "AURA SILENT FIRE",
-        "AURA ROMANTIC DAYDREAMS",
-        "AURA LOVESTRUCK DELIGHT",
-        "AURA WHIMSICAL WILD",
+    # Remove generic words that do not identify the product.
+    remove_words = [
+        "FACES",
+        "CANADA",
+        "EAU",
+        "DE",
+        "PARFUM",
+        "MINI",
+        "PURPLLE",
+        "PER",
+        "FG",
     ]
 
-    for phrase in phrases:
-        if phrase in s:
-            return norm(f"{phrase} {volume}")
+    for word in remove_words:
+        s = re.sub(
+            rf"\b{re.escape(word)}\b",
+            " ",
+            s,
+        )
 
-    return s
+    # Remove volume from the product-name portion; it is handled separately.
+    s = re.sub(
+        r"\b(?:20ML|50ML|100ML)\b",
+        " ",
+        s,
+    )
+
+    # Make common OCR/spelling variants consistent.
+    replacements = {
+        "ECSTECY": "ECSTASY",
+        "ROMENTIC": "ROMANTIC",
+        "LOVE STRUCK": "LOVESTRUCK",
+        "DAY DREAMS": "DAYDREAMS",
+        "LOVE-STRUCK": "LOVESTRUCK",
+        "DAY-DREAMS": "DAYDREAMS",
+    }
+
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+
+    # Spaces/hyphens should not matter:
+    # LOVE STRUCK DELIGHT == LOVESTRUCK DELIGHT
+    compact = re.sub(r"[^A-Z0-9]", "", s)
+
+    return compact, volume
 
 
 def match_to_master(invoice_description, master):
-    invoice_key = product_key(invoice_description)
+    """
+    Match invoice product to the master SKU.
 
-    master_keys = [
-        product_key(name)
-        for name in master["SKU Name"]
+    Important:
+    - Volume must match (20ml cannot map to 100ml).
+    - Fuzzy confidence threshold is 85%.
+    - The best 85%+ match is accepted even when the invoice has
+      spelling/OCR mistakes.
+    """
+
+    invoice_key, invoice_volume = product_key(invoice_description)
+
+    candidates = []
+
+    for index, row in master.iterrows():
+        master_key, master_volume = product_key(
+            row["SKU Name"]
+        )
+
+        # Never map a 20ml item to a 50/100ml SKU.
+        if (
+            invoice_volume
+            and master_volume
+            and invoice_volume != master_volume
+        ):
+            continue
+
+        candidates.append(
+            (index, master_key)
+        )
+
+    if not candidates:
+        return None, 0
+
+    candidate_keys = [
+        key for _, key in candidates
     ]
 
-    # Exact match first.
-    for index, key in enumerate(master_keys):
+    # Exact normalized match.
+    for (index, key) in candidates:
         if key == invoice_key:
-            return master.iloc[index], 100
+            return master.loc[index], 100
 
-    # Fuzzy match as a safety net.
-    result = process.extractOne(
+    # Fuzzy matching after removing spacing/hyphen differences.
+    best = process.extractOne(
         invoice_key,
-        master_keys,
-        scorer=fuzz.token_set_ratio,
+        candidate_keys,
+        scorer=fuzz.ratio,
     )
 
-    if result:
-        _, score, index = result
+    if best:
+        _, score, candidate_position = best
+        master_index = candidates[candidate_position][0]
 
-        if score >= 80:
-            return master.iloc[index], score
+        if score >= 85:
+            return (
+                master.loc[master_index],
+                score,
+            )
 
     return None, 0
 
