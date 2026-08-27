@@ -357,7 +357,7 @@ def extract_invoice_items(text):
     # then capture amount/rate/quantity from the table row.
     pattern = re.compile(
         r"""
-        (FG-PURPLLE-PER-(?:20|50|100)ML\s*-\s*[A-Z0-9][A-Z0-9 \-]*?)
+        (FG-PURPLLE-PER-(?:20|50|100)ML\s*-\s*.+?)
         \s+X\s+(\d+)
         \s+
         ([\d,]+\.\d+)
@@ -414,7 +414,7 @@ def extract_invoice_items(text):
     if not items:
         fallback = re.compile(
             r"""
-            (FG-PURPLLE-PER-\d+ML\s*-\s*[A-Z0-9][A-Z0-9 \-]*?)
+            (FG-PURPLLE-PER-\d+ML\s*-\s*.+?)
             \s+X\s+(\d+)
             .*?
             ([\d,]+\.\d+)
